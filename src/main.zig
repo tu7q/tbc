@@ -10,8 +10,9 @@ pub fn main() !void {
     var stdin_reader = stdin.reader(&buf);
     const reader = &stdin_reader.interface;
 
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
+    var arena_impl = std.heap.ArenaAllocator.init(gpa);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
 
     var interpreter: Interpreter = .init(gpa);
     defer interpreter.deinit();
@@ -21,13 +22,13 @@ pub fn main() !void {
         defer line_alloc.deinit();
 
         _ = try reader.streamDelimiterEnding(&line_alloc.writer, '\n');
-        const line = line_alloc.written();
-
         _ = reader.takeByte() catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
         try line_alloc.writer.writeAll("\n");
+
+        const line = try arena.dupe(u8, line_alloc.written());
 
         var scanner: compiler.Scanner = .{ .src = line };
         var parse_diag: compiler.Diagnostic = .{};
@@ -52,7 +53,7 @@ pub fn main() !void {
 
         var parser: compiler.Parser = .{ .src = tokens.items };
         const options: compiler.ParseOptions = .{
-            .allocator = arena.allocator(),
+            .allocator = arena_impl.allocator(),
             .diag = &parse_diag,
         };
 

@@ -63,16 +63,28 @@ pub fn executeStatement(self: *Interpreter, root: ast.Root) Allocator.Error!void
     if (root.line == null)
         return self.executeImmediately(root.stmt);
 
-    const instruction_index = self.indexOfLine(root.line.?.literal.?.number);
+    const line = root.line.?.literal.?.number;
+    const instruction_index = self.indexOfLine(line);
+    if (instruction_index < self.instructions.items.len) {
+        if (self.instructions.items[instruction_index].line == line) {
+            self.instructions.items[instruction_index] = .{ .line = line, .stmt = root.stmt };
+            return;
+        }
+    }
     try self.instructions.insert(self.gpa, instruction_index, .{
-        .line = root.line.?.literal.?.number,
+        .line = line,
         .stmt = root.stmt,
     });
 }
 
 fn executeImmediately(self: *Interpreter, stmt: ast.Stmt) void {
     self.eval(stmt);
-    self.run();
+    // If we didn't execute a goto or similar
+    // No need to do anything.
+    // This here is strong evidence that we should use
+    // ?usize for curr instead.
+    if (!self.should_advance)
+        self.run();
 }
 
 fn run(self: *Interpreter) void {
@@ -151,9 +163,26 @@ fn evalGoto(self: *Interpreter, expr: ast.Expr) void {
 }
 
 fn evalInput(self: *Interpreter, list: ast.VarList) void {
-    _ = self;
-    _ = list;
-    @panic("TODO");
+    const stdin = std.fs.File.stdin();
+    var buf: [1024]u8 = undefined;
+    var stdin_reader = stdin.reader(&buf);
+    const reader = &stdin_reader.interface;
+
+    // Hidden allocation yay...
+    var line_alloc: std.Io.Writer.Allocating = .init(self.gpa);
+    defer line_alloc.deinit();
+
+    _ = reader.streamDelimiter(&line_alloc.writer, '\n') catch @panic("");
+    _ = reader.takeByte() catch @panic("");
+
+    var it = std.mem.splitScalar(u8, line_alloc.written(), ' ');
+    var node: ?*const ast.VarList = &list;
+    while (node != null) : (node = node.?.next) {
+        const str = it.next() orelse @panic("Bad input");
+
+        const value: isize = std.fmt.parseInt(isize, str, 10) catch str[0];
+        self.variables[node.?.@"var".literal.?.@"var"] = value;
+    }
 }
 
 fn evalLet(self: *Interpreter, stmt: ast.LetStmt) void {
@@ -178,19 +207,30 @@ fn evalReturn(self: *Interpreter) void {
     self.curr = index;
 }
 
-fn evalClear(self: *Interpreter) void {
-    _ = self;
-    @panic("TODO");
+fn evalClear(_: *Interpreter) void {
+    std.debug.print("\x1B[2J\x1B[H", .{});
 }
 
 fn evalList(self: *Interpreter) void {
-    _ = self;
-    @panic("TODO");
+    const stdout = std.fs.File.stdout();
+    var stdout_writer = stdout.writer(&.{});
+
+    for (self.instructions.items) |instruction| {
+        const line_token = ast.Token{
+            .line = instruction.line,
+            .tag = .number,
+            .literal = .{ .number = @intCast(instruction.line) },
+        };
+        fmt.prettyPrint(
+            .{ .line = line_token, .stmt = instruction.stmt },
+            &stdout_writer.interface,
+        ) catch @panic("");
+    }
 }
 
 fn evalRun(self: *Interpreter) void {
-    _ = self;
-    @panic("TODO");
+    self.should_advance = false;
+    self.curr = 0;
 }
 
 fn evalEnd(self: *Interpreter) void {
