@@ -6,22 +6,20 @@ pub const Interpreter = @This();
 gpa: Allocator,
 
 /// The index of the current line.
-curr: usize = 0,
+curr: ?usize = null,
 
 /// All of the instructions
 instructions: std.ArrayList(Instruction) = .empty,
 
-/// Stack containing lines
-/// push on gosub
-/// pop on return
+/// Stack lines to goto
+/// Push via gosub
+/// Pop via return
 return_stack: std.ArrayList(usize) = .empty,
 
 // Variables.
 variables: [math.maxInt(u8)]isize,
 
-/// Whether or not the instruction should advance
-/// This should only ever false on a GOTO and GOSUB
-should_advance: bool = false,
+advance_with_step: bool = false,
 
 const Instruction = struct {
     stmt: ast.Stmt,
@@ -41,12 +39,26 @@ pub fn deinit(self: *Interpreter) void {
     self.* = undefined;
 }
 
+pub fn execSource(self: *Interpreter, src: []const ast.Root) !void {
+    for (src) |stmt| {
+        try self.executeStatement(stmt);
+    }
+    if (self.instructions.items.len > 0) {
+        self.curr = 0;
+        self.run();
+    }
+}
+
 fn indexOfLine(self: Interpreter, line: usize) usize {
-    return std.sort.upperBound(Instruction, self.instructions.items, line, struct {
+    const upper = std.sort.upperBound(Instruction, self.instructions.items, line, struct {
         pub fn compareFn(ctx: usize, instruction: Instruction) math.Order {
             return math.order(ctx, instruction.line);
         }
     }.compareFn);
+    if (upper > 0 and self.instructions.items[upper - 1].line == line) {
+        return upper - 1;
+    }
+    return upper;
 }
 
 fn indexOfLineStrict(self: Interpreter, line: usize) ?usize {
@@ -58,39 +70,38 @@ fn indexOfLineStrict(self: Interpreter, line: usize) ?usize {
 }
 
 pub fn executeStatement(self: *Interpreter, root: ast.Root) Allocator.Error!void {
-    self.should_advance = true;
-
-    if (root.line == null)
-        return self.executeImmediately(root.stmt);
-
-    const line = root.line.?.literal.?.number;
-    const instruction_index = self.indexOfLine(line);
-    if (instruction_index < self.instructions.items.len) {
-        if (self.instructions.items[instruction_index].line == line) {
-            self.instructions.items[instruction_index] = .{ .line = line, .stmt = root.stmt };
-            return;
+    if (root.line) |line| {
+        const index = self.indexOfLine(line);
+        if (index < self.instructions.items.len and self.instructions.items[index].line == line) {
+            self.instructions.items[index].stmt = root.stmt;
+        } else {
+            try self.instructions.insert(self.gpa, index, .{
+                .line = line,
+                .stmt = root.stmt,
+            });
         }
+    } else {
+        assert(self.curr == null);
+        return self.executeImmediately(root.stmt);
     }
-    try self.instructions.insert(self.gpa, instruction_index, .{
-        .line = line,
-        .stmt = root.stmt,
-    });
 }
 
 fn executeImmediately(self: *Interpreter, stmt: ast.Stmt) void {
     self.eval(stmt);
-    // If we didn't execute a goto or similar
-    // No need to do anything.
-    // This here is strong evidence that we should use
-    // ?usize for curr instead.
-    if (!self.should_advance)
-        self.run();
+    self.run();
 }
 
 fn run(self: *Interpreter) void {
-    while (self.curr < self.instructions.items.len) {
-        self.should_advance = true;
-        self.eval(self.instructions.items[self.curr].stmt);
+    while (self.curr) |curr| {
+        self.advance_with_step = true;
+        self.eval(self.instructions.items[curr].stmt);
+
+        if (self.curr != null) if (self.advance_with_step) {
+            self.curr.? += 1;
+            if (self.curr.? >= self.instructions.items.len) {
+                self.curr = null;
+            }
+        };
     }
 }
 
@@ -108,40 +119,25 @@ fn eval(self: *Interpreter, stmt: ast.Stmt) void {
         .run => self.evalRun(),
         .end => self.evalEnd(),
     }
-
-    if (self.should_advance)
-        self.curr += 1;
 }
 
 fn evalPrint(self: *Interpreter, list: ast.ExprList) void {
     switch (list.expr) {
-        .string => |str| std.debug.print("{s}", .{str.literal.?.string}),
+        .string => |str| std.debug.print("{s}", .{str}),
         .expr => |expr| std.debug.print("{d}", .{self.computeExpr(expr)}),
     }
 
-    if (list.next) |next|
-        self.evalPrintCont(next.*)
-    else
-        std.debug.print("\n", .{});
-}
-
-fn evalPrintCont(self: Interpreter, list: ast.ExprList) void {
-    switch (list.expr) {
-        .string => |str| std.debug.print(" {s}", .{str.literal.?.string}),
-        .expr => |expr| std.debug.print(" {d}", .{self.computeExpr(expr)}),
-    }
-
-    if (list.next) |next|
-        self.evalPrintCont(next.*)
-    else
-        std.debug.print("\n", .{});
+    if (list.next) |next| {
+        std.debug.print(" ", .{});
+        self.evalPrint(next.*);
+    } else std.debug.print("\n", .{});
 }
 
 fn evalIfStmt(self: *Interpreter, if_stmt: ast.IfStmt) void {
     const lhs = self.computeExpr(if_stmt.lhs_expr);
     const rhs = self.computeExpr(if_stmt.rhs_expr);
 
-    const then = switch (if_stmt.relop.tag) {
+    const then = switch (if_stmt.relop) {
         .equal => lhs == rhs,
         .greater => lhs > rhs,
         .greater_equal => lhs >= rhs,
@@ -159,7 +155,7 @@ fn evalGoto(self: *Interpreter, expr: ast.Expr) void {
     const line = self.computeExpr(expr);
     const index = self.indexOfLineStrict(@intCast(line)) orelse @panic("TODO");
     self.curr = index;
-    self.should_advance = false;
+    self.advance_with_step = false;
 }
 
 fn evalInput(self: *Interpreter, list: ast.VarList) void {
@@ -181,12 +177,12 @@ fn evalInput(self: *Interpreter, list: ast.VarList) void {
         const str = it.next() orelse @panic("Bad input");
 
         const value: isize = std.fmt.parseInt(isize, str, 10) catch str[0];
-        self.variables[node.?.@"var".literal.?.@"var"] = value;
+        self.variables[node.?.@"var"] = value;
     }
 }
 
 fn evalLet(self: *Interpreter, stmt: ast.LetStmt) void {
-    self.variables[stmt.@"var".literal.?.@"var"] = self.computeExpr(stmt.expr);
+    self.variables[stmt.@"var"] = self.computeExpr(stmt.expr);
 }
 
 fn evalGosub(self: *Interpreter, expr: ast.Expr) void {
@@ -195,10 +191,9 @@ fn evalGosub(self: *Interpreter, expr: ast.Expr) void {
     // TODO:
     // If the very first instruction is an immediately evaluated GOTO
     // Then the return_stack will be broken.
-    self.return_stack.append(self.gpa, self.instructions.items[self.curr].line) catch @panic("TODO");
+    self.return_stack.append(self.gpa, self.instructions.items[self.curr.?].line) catch @panic("TODO");
     self.curr = index;
-
-    self.should_advance = false;
+    self.advance_with_step = false;
 }
 
 fn evalReturn(self: *Interpreter) void {
@@ -216,45 +211,37 @@ fn evalList(self: *Interpreter) void {
     var stdout_writer = stdout.writer(&.{});
 
     for (self.instructions.items) |instruction| {
-        const line_token = ast.Token{
-            .line = instruction.line,
-            .tag = .number,
-            .literal = .{ .number = @intCast(instruction.line) },
-        };
         fmt.prettyPrint(
-            .{ .line = line_token, .stmt = instruction.stmt },
+            .{ .line = instruction.line, .stmt = instruction.stmt },
             &stdout_writer.interface,
         ) catch @panic("");
     }
 }
 
 fn evalRun(self: *Interpreter) void {
-    self.should_advance = false;
-    self.curr = 0;
+    self.curr = if (self.instructions.items.len > 0) 0 else null;
 }
 
 fn evalEnd(self: *Interpreter) void {
-    self.should_advance = false;
-    self.curr = math.maxInt(usize);
+    self.curr = null;
 }
 
 fn computeExpr(self: Interpreter, expr: ast.Expr) isize {
     return switch (expr) {
-        .literal => |token| switch (token.literal.?) {
-            .number => token.literal.?.number,
-            .@"var" => self.variables[token.literal.?.@"var"],
+        .literal => |token| switch (token) {
+            .number => |n| @intCast(n),
+            .@"var" => |v| self.variables[v],
             .string => unreachable,
         },
-        .unary => |unary| switch (unary.op.tag) {
+        .unary => |unary| switch (unary.op) {
             .minus => -1 * self.computeExpr(unary.rhs),
             else => unreachable,
         },
-        .binary => |binary| switch (binary.op.tag) {
+        .binary => |binary| switch (binary.op) {
             .minus => self.computeExpr(binary.lhs) - self.computeExpr(binary.rhs),
             .plus => self.computeExpr(binary.lhs) + self.computeExpr(binary.rhs),
-            .slash => @panic("TODO"),
-            .star => self.computeExpr(binary.lhs) * self.computeExpr(binary.rhs),
-            else => unreachable,
+            .div => @panic("TODO"),
+            .mul => self.computeExpr(binary.lhs) * self.computeExpr(binary.rhs),
         },
         .grouping => |grouping| self.computeExpr(grouping.*),
     };

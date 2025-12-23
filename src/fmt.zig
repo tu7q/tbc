@@ -3,11 +3,7 @@
 ///
 pub fn prettyPrint(root: ast.Root, writer: *Io.Writer) !void {
     if (root.line) |line| {
-        assert(line.literal != null);
-        assert(line.literal.? == .number);
-        assert(line.tag == .number);
-
-        try writer.print("{d} ", .{line.literal.?.number});
+        try writer.print("{d} ", .{line});
     }
 
     try ppStmt(root.stmt, writer);
@@ -16,7 +12,7 @@ pub fn prettyPrint(root: ast.Root, writer: *Io.Writer) !void {
 
 ///
 pub fn ppUnaryExpr(unary_expr: *ast.UnaryExpr, writer: *Io.Writer) anyerror!void {
-    const lexeme = switch (unary_expr.op.tag) {
+    const lexeme = switch (unary_expr.op) {
         .plus => "+",
         .minus => "-",
         else => @panic("token was not a unary operator"),
@@ -28,12 +24,11 @@ pub fn ppUnaryExpr(unary_expr: *ast.UnaryExpr, writer: *Io.Writer) anyerror!void
 
 ///
 pub fn ppBinaryExpr(binaray_expr: *ast.BinaryExpr, writer: *Io.Writer) !void {
-    const lexeme = switch (binaray_expr.op.tag) {
-        .slash => "/",
-        .star => "*",
+    const lexeme = switch (binaray_expr.op) {
+        .div => "/",
+        .mul => "*",
         .minus => "-",
         .plus => "+",
-        else => @panic("token was not a binary operator"),
     };
 
     try ppExpr(binaray_expr.lhs, writer);
@@ -42,9 +37,8 @@ pub fn ppBinaryExpr(binaray_expr: *ast.BinaryExpr, writer: *Io.Writer) !void {
 }
 
 ///
-pub fn ppLiteralExpr(literal: ast.Token, writer: *Io.Writer) anyerror!void {
-    assert(literal.literal != null);
-    switch (literal.literal.?) {
+pub fn ppLiteralExpr(literal: ast.ValuedLiteral, writer: *Io.Writer) anyerror!void {
+    switch (literal) {
         .@"var" => |v| try writer.print("{c}", .{v}),
         .number => |n| try writer.print("{d}", .{n}),
         .string => |s| try writer.print("{s}", .{s}),
@@ -72,7 +66,7 @@ pub fn ppExpr(expr: ast.Expr, writer: *Io.Writer) anyerror!void {
 pub fn ppExprList(list: ast.ExprList, writer: *Io.Writer) !void {
     switch (list.expr) {
         .expr => |expr| try ppExpr(expr, writer),
-        .string => |s| try writer.print("\"{s}\"", .{s.literal.?.string}),
+        .string => |s| try writer.print("\"{s}\"", .{s}),
     }
 
     if (list.next) |next| {
@@ -83,10 +77,7 @@ pub fn ppExprList(list: ast.ExprList, writer: *Io.Writer) !void {
 
 ///
 pub fn ppVarList(list: ast.VarList, writer: *Io.Writer) !void {
-    assert(list.@"var".literal != null);
-    assert(list.@"var".tag == .@"var");
-
-    try writer.print("{c}", .{list.@"var".literal.?.@"var"});
+    try writer.print("{c}", .{list.@"var"});
     if (list.next) |next| {
         try writer.writeAll(", ");
         try ppVarList(next.*, writer);
@@ -94,16 +85,15 @@ pub fn ppVarList(list: ast.VarList, writer: *Io.Writer) !void {
 }
 
 ///
-pub fn ppRelop(relop: ast.Token, writer: *Io.Writer) !void {
-    assert(relop.literal == null);
-
-    const lexeme = switch (relop.tag) {
+pub fn ppRelop(relop: ast.Relop, writer: *Io.Writer) !void {
+    const lexeme = switch (relop) {
         .less => "<",
         .less_equal => "<=",
         .less_greater => "<>",
         .greater => ">",
         .greater_equal => ">=",
-        else => @panic("not a relop"),
+        .greater_less => "><",
+        .equal => "=",
     };
 
     try writer.print(" {s} ", .{lexeme});
@@ -134,7 +124,7 @@ pub fn ppStmt(stmt: ast.Stmt, writer: *Io.Writer) !void {
         },
         .let => |let| {
             try writer.writeAll("LET ");
-            try writer.print("{c} = ", .{let.@"var".literal.?.@"var"});
+            try writer.print("{c} = ", .{let.@"var"});
             try ppExpr(let.expr, writer);
         },
         .gosub => |expr| {

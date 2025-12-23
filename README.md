@@ -20,10 +20,9 @@ PRINT "Hello, World!"
 More examples can be found in the examples directory.
 
 ## TODOS
-1. Proper support for running a file (instead of hacking a GOTO startline into each example)
-2. AST rewrite
-3. Add missing evals to interpreter
-4. Add compilation support (long term goal)
+1. Better diagnostic support. (especially in REPL)
+2. Proper support for running a file
+3. Add compilation support (long term goal)
 
 <!-- LICENSE -->
 ## License

@@ -1,10 +1,6 @@
 //! src/ast.zig
-//! Contains all of the AST implementation for the Tiny Basic language
 
-/// The types of tokens we can have:
-/// TODO: Rename to TokenKind
-pub const TokenTag = enum {
-    // Single character tokens
+pub const TokenKind = enum {
     left_paren,
     right_paren,
     comma,
@@ -12,21 +8,13 @@ pub const TokenTag = enum {
     plus,
     slash,
     star,
-    @"var",
     equal,
-
-    // One or two character tokens
     greater,
     greater_equal,
+    greater_less,
     less,
     less_equal,
     less_greater,
-
-    // Literals
-    string,
-    number,
-
-    // Keywords
     print,
     @"if",
     then,
@@ -39,97 +27,31 @@ pub const TokenTag = enum {
     list,
     run,
     end,
-
-    // Natural Seperations (Tiny Basic works on a line-by-line basis so this works)
     eol,
     eof,
-};
-
-/// Literal types
-/// as a hack variables are also literals.
-pub const LiteralType = enum {
+    @"var",
     number,
     string,
-    @"var",
 };
 
-/// The literal values.
-pub const Literal = union(LiteralType) {
-    number: u32,
-    string: []const u8,
-    // For convenience we can pretend that a variable is a literal
-    @"var": u8,
-};
-
-/// Extremely simple token: line, tag and literal.
-pub const Token = struct {
-    // Line of the token.
-    line: usize,
-
-    // The tag for the token
-    tag: TokenTag,
-
-    // Literal data
-    literal: ?Literal,
-};
-
-/// Root statement of each line.
-pub const Root = struct {
-    line: ?Token,
-    stmt: Stmt,
-};
-
-/// An expression with one argument to the right of the operator.
-pub const UnaryExpr = struct {
-    op: Token,
-    rhs: Expr,
-};
-
-/// An expression with arguments to the left and right of the operator.
-pub const BinaryExpr = struct {
-    op: Token,
-    lhs: Expr,
-    rhs: Expr,
-};
-
-/// Possible kinds of expressions
-pub const ExprTag = enum {
-    unary,
-    binary,
-    literal,
-    grouping,
-};
-
-/// Any expression
-pub const Expr = union(ExprTag) {
-    unary: *UnaryExpr,
-    binary: *BinaryExpr,
-    literal: Token,
-    grouping: *Expr,
-};
-
-/// A linked list of variables.
-pub const VarList = struct {
-    @"var": Token,
-    next: ?*VarList,
-};
-
-pub const ExprListValueTag = enum { string, expr };
-
-pub const ExprListValue = union(ExprListValueTag) {
-    string: Token,
-    expr: Expr,
-};
-
-/// A linked list of expression values.
-pub const ExprList = struct {
-    expr: ExprListValue,
-    next: ?*ExprList,
-};
-
-pub const StmtTag = enum {
+pub const Token = union(TokenKind) {
+    left_paren,
+    right_paren,
+    comma,
+    minus,
+    plus,
+    slash,
+    star,
+    equal,
+    greater,
+    greater_equal,
+    greater_less,
+    less,
+    less_equal,
+    less_greater,
     print,
     @"if",
+    then,
     goto,
     input,
     let,
@@ -139,32 +61,135 @@ pub const StmtTag = enum {
     list,
     run,
     end,
+    eol,
+    eof: void,
+    @"var": u8,
+    number: usize,
+    string: []const u8,
+
+    pub fn valued_literal(self: Token) ?ValuedLiteral {
+        return switch (self) {
+            .@"var" => |v| .{ .@"var" = v },
+            .number => |v| .{ .number = v },
+            else => null,
+        };
+    }
+
+    pub fn relop(self: Token) ?Relop {
+        return switch (self) {
+            .less => .less,
+            .less_equal => .less_equal,
+            .less_greater => .less_greater,
+            .greater => .greater,
+            .greater_equal => .greater_equal,
+            .greater_less => .greater_less,
+            .equal => .equal,
+            else => null,
+        };
+    }
+
+    pub fn op(self: Token) ?Operator {
+        return switch (self) {
+            .plus => .plus,
+            .minus => .minus,
+            .star => .mul,
+            .slash => .div,
+            else => null,
+        };
+    }
+};
+
+pub const ValuedLiteral = union(enum) {
+    @"var": u8,
+    number: usize,
+    string: []const u8,
+};
+
+pub const Relop = enum {
+    less,
+    less_equal,
+    less_greater,
+    greater,
+    greater_equal,
+    greater_less,
+    equal,
+};
+
+pub const Operator = enum {
+    plus,
+    minus,
+    div,
+    mul,
+};
+
+/// Root statement of each line.
+pub const Root = struct {
+    line: ?usize,
+    stmt: Stmt,
+};
+
+/// An expression with one argument to the right of the operator.
+pub const UnaryExpr = struct {
+    op: Operator,
+    rhs: Expr,
+};
+
+/// An expression with arguments to the left and right of the operator.
+pub const BinaryExpr = struct {
+    op: Operator,
+    lhs: Expr,
+    rhs: Expr,
+};
+
+/// Any expression
+pub const Expr = union(enum) {
+    unary: *UnaryExpr,
+    binary: *BinaryExpr,
+    literal: ValuedLiteral,
+    grouping: *Expr,
+};
+
+/// A linked list of variables.
+pub const VarList = struct {
+    @"var": u8,
+    next: ?*VarList,
+};
+
+pub const ExprListValue = union(enum) {
+    string: []const u8,
+    expr: Expr,
+};
+
+/// A linked list of expression values.
+pub const ExprList = struct {
+    expr: ExprListValue,
+    next: ?*ExprList,
 };
 
 /// Any statement
-pub const Stmt = union(StmtTag) {
+pub const Stmt = union(enum) {
     print: ExprList,
     @"if": *IfStmt,
-    goto: Expr,
     input: VarList,
     let: LetStmt,
+    goto: Expr,
     gosub: Expr,
-    @"return": void,
-    clear: void,
-    list: void,
-    run: void,
-    end: void,
+    @"return",
+    clear,
+    list,
+    run,
+    end,
 };
 
 pub const IfStmt = struct {
     lhs_expr: Expr,
-    relop: Token,
+    relop: Relop,
     rhs_expr: Expr,
     stmt: Stmt,
 };
 
 pub const LetStmt = struct {
-    @"var": Token,
+    @"var": u8,
     expr: Expr,
 };
 

@@ -7,24 +7,22 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const ast = @import("ast.zig");
-const TokenTag = ast.TokenTag;
-const Token = ast.Token;
 
 pub const SyntaxError = error{
     UnterminatedString,
     UnexpectedCharacter,
     UnknownIdentifier,
     UnexpectedToken,
-    NumberExceedsMaxValue,
 };
 
-pub const CompileError = SyntaxError || Allocator.Error;
+pub const CompileError = SyntaxError || Allocator.Error || error{Overflow};
 
 /// Diagnostic infromation for the scanner (This should probably be split for both scanner and parser to avoid weird bugs)
+/// TODO: Switch out diagnostic implementation based on current mode (immediate/delayed)
 pub const Diagnostic = struct {
     line: ?usize = null,
-    expected: ?TokenTag = null,
 
+    /// Report an error to a file
     pub fn reportToFile(diag: Diagnostic, file: std.fs.File, err: anyerror) !void {
         var buf: [1024]u8 = undefined;
         var writer = file.writer(&buf);
@@ -32,34 +30,16 @@ pub const Diagnostic = struct {
         return writer.interface.flush();
     }
 
-    /// Report err
+    /// Report an error
     pub fn report(diag: Diagnostic, stream: *std.Io.Writer, err: anyerror) !void {
-        try stream.print("err: {any}\n", .{err});
-
-        const line = diag.line orelse return;
-        try stream.print("{d}\n", .{line});
-
-        const expected = diag.expected orelse return;
-        try stream.print("{s}\n", .{@tagName(expected)});
-
-        switch (err) {
-            SyntaxError.UnterminatedString => try stream.print(
-                "unterminated string on line: {d}\n",
-                .{line},
-            ),
-            SyntaxError.UnexpectedCharacter => try stream.print(
-                "unexpected character on line: {d}\n",
-                .{line},
-            ),
-            SyntaxError.UnknownIdentifier => try stream.print(
-                "unexpected identifier on line: {d}\n",
-                .{line},
-            ),
-            SyntaxError.UnexpectedToken => try stream.print(
-                "unexpected token on line: {d}\n",
-                .{line},
-            ),
-            else => try stream.print("error while scanning: {s}\n", .{@errorName(err)}),
+        if (diag.line) |line| {
+            switch (err) {
+                SyntaxError.UnterminatedString => try stream.print("unterminated string on line: {d}\n", .{line}),
+                SyntaxError.UnexpectedCharacter => try stream.print("unexpected character on line: {d}\n", .{line}),
+                SyntaxError.UnknownIdentifier => try stream.print("unexpected identifier on line: {d}\n", .{line}),
+                SyntaxError.UnexpectedToken => try stream.print("unexpected token on line: {d}\n", .{line}),
+                else => try stream.print("{s} on line {d}\n", .{ @errorName(err), line }),
+            }
         }
     }
 };
@@ -117,17 +97,8 @@ pub const Scanner = struct {
         return true;
     }
 
-    /// Helper to quickly produce a token
-    fn token(self: Scanner, tag: TokenTag) Token {
-        return Token{
-            .line = self.line,
-            .tag = tag,
-            .literal = null,
-        };
-    }
-
     /// Retrieves the next token. returns null when reached the end
-    pub fn scanNextToken(self: *Scanner, diagnostic: ?*Diagnostic) ?(SyntaxError!Token) {
+    pub fn scanNextToken(self: *Scanner, diagnostic: ?*Diagnostic) ?(SyntaxError!ast.Token) {
         if (self.done) return null;
 
         while (self.peekAndAdvance()) |c| {
@@ -138,23 +109,23 @@ pub const Scanner = struct {
                 // Except for newlines.
                 '\n' => {
                     defer self.line += 1;
-                    return self.token(.eol);
+                    return ast.Token{ .eol = {} };
                 },
                 // Single character tokens (with no ambiguity)
-                '(' => return self.token(.left_paren),
-                ')' => return self.token(.right_paren),
-                ',' => return self.token(.comma),
-                '-' => return self.token(.minus),
-                '+' => return self.token(.plus),
-                '/' => return self.token(.slash),
-                '*' => return self.token(.star),
-                '=' => return self.token(.equal),
+                '(' => return ast.Token{ .left_paren = {} },
+                ')' => return ast.Token{ .right_paren = {} },
+                ',' => return ast.Token{ .comma = {} },
+                '-' => return ast.Token{ .minus = {} },
+                '+' => return ast.Token{ .plus = {} },
+                '/' => return ast.Token{ .slash = {} },
+                '*' => return ast.Token{ .star = {} },
+                '=' => return ast.Token{ .equal = {} },
                 // One or two letter characters with potential ambiguity
-                '>' => return self.token(if (self.match('=')) .greater_equal else .greater),
+                '>' => return if (self.match('=')) ast.Token{ .greater_equal = {} } else ast.Token{ .greater = {} },
                 '<' => {
-                    if (self.match('=')) return self.token(.less_equal);
-                    if (self.match('>')) return self.token(.less_greater);
-                    return self.token(.less);
+                    if (self.match('=')) return ast.Token{ .less_equal = {} };
+                    if (self.match('>')) return ast.Token{ .less_greater = {} };
+                    return ast.Token{ .less = {} };
                 },
                 // Identifiers
                 'A'...'Z' => return try self.scanIdent(diagnostic),
@@ -170,11 +141,11 @@ pub const Scanner = struct {
 
         // Mark as done to avoid emitting multiple EOF
         self.done = true;
-        return self.token(.eof);
+        return ast.Token{ .eof = {} };
     }
 
     /// Internal fn to scan for an identifier - any alphabetic token - eg keywords and vars
-    fn scanIdent(self: *Scanner, diagnostic: ?*Diagnostic) SyntaxError!Token {
+    fn scanIdent(self: *Scanner, diagnostic: ?*Diagnostic) SyntaxError!ast.Token {
         while (!self.isAtEnd()) {
             switch (self.peekAssumeInBounds()) {
                 'A'...'Z' => _ = self.advance(),
@@ -186,10 +157,9 @@ pub const Scanner = struct {
 
         if (ident.len == 1) {
             // Must be a var
-            return Token{ .line = self.line, .tag = .@"var", .literal = .{ .@"var" = ident[0] } };
-        } else if (KEYWORDS.get(ident)) |tag| {
-            // Must be a keyword
-            return self.token(tag);
+            return ast.Token{ .@"var" = ident[0] };
+        } else if (KEYWORDS.get(ident)) |tkn| {
+            return tkn;
         }
 
         // Just some random A...Z characters that aren't any keywords
@@ -198,7 +168,7 @@ pub const Scanner = struct {
     }
 
     /// Internal fn to scan for strings
-    fn scanString(self: *Scanner, diagnostic: ?*Diagnostic) SyntaxError!Token {
+    fn scanString(self: *Scanner, diagnostic: ?*Diagnostic) SyntaxError!ast.Token {
         // Have already scanned opening '""'
         // Scan until closing '"'
         while (!self.isAtEnd()) {
@@ -222,15 +192,11 @@ pub const Scanner = struct {
         self.advance();
 
         const string_literal = self.src[self.start + 1 .. self.current - 1];
-        return Token{
-            .line = self.line,
-            .tag = .string,
-            .literal = .{ .string = string_literal },
-        };
+        return ast.Token{ .string = string_literal };
     }
 
     /// Internal fn to scan for numbers
-    fn scanNumber(self: *Scanner, _: ?*Diagnostic) SyntaxError!Token {
+    fn scanNumber(self: *Scanner, _: ?*Diagnostic) SyntaxError!ast.Token {
         while (!self.isAtEnd()) {
             switch (self.peekAssumeInBounds()) {
                 '0'...'9' => self.advance(),
@@ -238,34 +204,32 @@ pub const Scanner = struct {
             }
         }
 
-        const number_literal_str = self.src[self.start..self.current];
-        const number_literal = std.fmt.parseUnsigned(u32, number_literal_str, 10) catch |err| switch (err) {
+        const number_str = self.src[self.start..self.current];
+        const number = std.fmt.parseUnsigned(u32, number_str, 10) catch |err| switch (err) {
             error.InvalidCharacter => unreachable,
-            error.Overflow => return error.NumberExceedsMaxValue,
+            error.Overflow => @panic("TODO: Handle overflow."),
         };
 
-        return Token{
-            .line = self.line,
-            .tag = .number,
-            .literal = .{ .number = number_literal },
+        return ast.Token{
+            .number = number,
         };
     }
 };
 
 /// Mapping of keywords to their TokenTag
-const KEYWORDS = std.StaticStringMap(TokenTag).initComptime(.{
-    .{ "PRINT", .print },
-    .{ "IF", .@"if" },
-    .{ "THEN", .then },
-    .{ "GOTO", .goto },
-    .{ "INPUT", .input },
-    .{ "LET", .let },
-    .{ "GOSUB", .gosub },
-    .{ "RETURN", .@"return" },
-    .{ "CLEAR", .clear },
-    .{ "LIST", .list },
-    .{ "RUN", .run },
-    .{ "END", .end },
+const KEYWORDS = std.StaticStringMap(ast.Token).initComptime(.{
+    .{ "PRINT", ast.Token{ .print = {} } },
+    .{ "IF", ast.Token{ .@"if" = {} } },
+    .{ "THEN", ast.Token{ .then = {} } },
+    .{ "GOTO", ast.Token{ .goto = {} } },
+    .{ "INPUT", ast.Token{ .input = {} } },
+    .{ "LET", ast.Token{ .let = {} } },
+    .{ "GOSUB", ast.Token{ .gosub = {} } },
+    .{ "RETURN", ast.Token{ .@"return" = {} } },
+    .{ "CLEAR", ast.Token{ .clear = {} } },
+    .{ "LIST", ast.Token{ .list = {} } },
+    .{ "RUN", ast.Token{ .run = {} } },
+    .{ "END", ast.Token{ .end = {} } },
 });
 
 ///
@@ -280,10 +244,22 @@ pub const ParseOptions = struct {
 /// Parser
 pub const Parser = struct {
     /// The tokens that need to be parsed
-    src: []const Token,
+    src: []const ast.Token,
 
     /// The currrent token being considered
     current: usize = 0,
+
+    /// Count the number of lines from the start of src to the current line.
+    /// Lines start at one.
+    fn countLines(self: Parser) usize {
+        var lines: usize = 1;
+        for (self.src) |t| switch (t) {
+            .eol => lines += 1,
+            else => {},
+        };
+
+        return lines;
+    }
 
     ///
     fn isIndexAtEnd(self: Parser, index: usize) bool {
@@ -296,19 +272,19 @@ pub const Parser = struct {
     }
 
     ///
-    fn peek(self: Parser) Token {
+    fn peek(self: Parser) ast.Token {
         assert(!self.isAtEnd());
         return self.src[self.current];
     }
 
     ///
-    fn previous(self: Parser) Token {
+    fn previous(self: Parser) ast.Token {
         assert(self.current > 0 and self.current <= self.src.len);
         return self.src[self.current - 1];
     }
 
     ///
-    fn peekAndAdvance(self: *Parser) ?Token {
+    fn peekAndAdvance(self: *Parser) ?ast.Token {
         if (self.isAtEnd()) return null;
         defer self.current += 1;
         return self.peek();
@@ -319,20 +295,19 @@ pub const Parser = struct {
         self.current += 1;
     }
 
-    fn consume(self: *Parser, tag: TokenTag, maybe_diag: ?*Diagnostic) CompileError!void {
+    fn consume(self: *Parser, tag: ast.TokenKind, maybe_diag: ?*Diagnostic) CompileError!void {
         if (self.matchTag(tag)) return;
 
         if (maybe_diag) |diag| {
             // Note: self.previous() not safe here.
-            diag.line = if (self.isAtEnd()) null else self.previous().line;
-            diag.expected = tag;
+            diag.line = if (self.isAtEnd()) null else self.countLines();
         }
         return error.UnexpectedToken;
     }
 
-    fn matchTag(self: *Parser, tag: TokenTag) bool {
+    fn matchTag(self: *Parser, tag: ast.TokenKind) bool {
         if (self.isAtEnd()) return false;
-        if (self.peek().tag != tag) return false;
+        if (self.peek() != tag) return false;
         self.advance();
         return true;
     }
@@ -346,12 +321,10 @@ pub const Parser = struct {
         }
 
         if (self.isAtEnd()) return false;
-        const current_tag = self.peek().tag;
+        const current_tag = std.meta.activeTag(self.peek());
 
         // This should be converted to a switch by the optimizer but not sure
         inline for (tag_args_info.@"struct".fields) |field| {
-            // assert(field.type)
-
             if (@field(tag_args, field.name) == current_tag) {
                 self.advance();
                 return true;
@@ -384,7 +357,7 @@ pub const Parser = struct {
         // Check for line number
         const line_number = if (self.matchTag(.number)) blk: {
             // Safe to unwrap since we've advanced just before and it's known to be a NUMBER
-            break :blk self.previous();
+            break :blk self.previous().number;
         } else null;
 
         const root: ast.Root = .{
@@ -395,18 +368,18 @@ pub const Parser = struct {
         if (self.match(.{ .eol, .eof })) return root;
 
         // Line did not end with EOL or EOF
-        if (opts.diag) |diag| diag.line = self.previous().line;
+        if (opts.diag) |diag| diag.line = self.countLines();
         return error.UnexpectedToken;
     }
 
     fn parseStmt(self: *Parser, opts: ParseOptions) CompileError!ast.Stmt {
         if (self.isAtEnd()) {
-            if (opts.diag) |diag| diag.line = self.previous().line;
+            if (opts.diag) |diag| diag.line = self.countLines();
             return error.UnexpectedToken;
         }
 
         // Note this whole thing is a code smell
-        switch (self.peekAndAdvance().?.tag) {
+        switch (self.peekAndAdvance().?) {
             .print => return ast.Stmt{ .print = try self.parseExprList(opts) },
             .@"if" => {
                 const if_stmt = try opts.allocator.create(ast.IfStmt);
@@ -424,29 +397,29 @@ pub const Parser = struct {
             .end => return ast.Stmt{ .end = {} },
             else => {
                 self.current -= 1;
-                if (opts.diag) |diag| diag.line = self.previous().line;
+                if (opts.diag) |diag| diag.line = self.countLines();
                 return error.UnexpectedToken;
             },
         }
     }
 
     fn parseIfStmt(self: *Parser, opts: ParseOptions) CompileError!ast.IfStmt {
-        assert(self.previous().tag == .@"if");
+        assert(self.previous() == .@"if");
 
         // Note: This is a BinaryExpr.
         const lhs_expr = try self.parseExpr(opts);
-        const relop = if (self.match(.{
+        const cmp = if (self.match(.{
             .less_greater,
             .less_equal,
             .less,
-            // .greater_less,
+            .greater_less,
             .greater_equal,
             .greater,
             .equal,
         }))
             self.previous()
         else {
-            if (opts.diag) |diag| diag.line = self.previous().line;
+            if (opts.diag) |diag| diag.line = self.countLines();
             return error.UnexpectedToken;
         };
         const rhs_expr = try self.parseExpr(opts);
@@ -455,29 +428,29 @@ pub const Parser = struct {
 
         return ast.IfStmt{
             .lhs_expr = lhs_expr,
-            .relop = relop,
+            .relop = cmp.relop().?,
             .rhs_expr = rhs_expr,
             .stmt = stmt,
         };
     }
 
     fn parseLetStmt(self: *Parser, opts: ParseOptions) CompileError!ast.LetStmt {
-        assert(self.previous().tag == .let);
+        assert(self.previous() == .let);
 
         try self.consume(.@"var", opts.diag);
-        const @"var" = self.previous();
+        const token = self.previous();
 
         try self.consume(.equal, opts.diag);
 
         return .{
-            .@"var" = @"var",
+            .@"var" = token.@"var",
             .expr = try self.parseExpr(opts),
         };
     }
 
     fn parseExprListValue(self: *Parser, opts: ParseOptions) CompileError!ast.ExprListValue {
         if (self.matchTag(.string)) {
-            return ast.ExprListValue{ .string = self.previous() };
+            return ast.ExprListValue{ .string = self.previous().string };
         }
         return ast.ExprListValue{ .expr = try self.parseExpr(opts) };
     }
@@ -507,7 +480,7 @@ pub const Parser = struct {
         try self.consume(.@"var", opts.diag);
 
         var head = ast.VarList{
-            .@"var" = self.previous(),
+            .@"var" = self.previous().@"var",
             .next = null,
         };
 
@@ -532,7 +505,7 @@ pub const Parser = struct {
 
     fn parseFactor(self: *Parser, opts: ParseOptions) CompileError!ast.Expr {
         if (self.match(.{ .@"var", .number })) {
-            return ast.Expr{ .literal = self.previous() };
+            return ast.Expr{ .literal = self.previous().valued_literal().? };
         }
         return self.parseGrouping(opts);
     }
@@ -544,7 +517,7 @@ pub const Parser = struct {
             const binary_expr = try opts.allocator.create(ast.BinaryExpr);
             binary_expr.* = .{
                 .lhs = expr,
-                .op = self.previous(),
+                .op = self.previous().op().?,
                 .rhs = try self.parseFactor(opts),
             };
             expr = .{ .binary = binary_expr };
@@ -557,7 +530,7 @@ pub const Parser = struct {
         var expr = if (self.match(.{ .plus, .minus })) blk: {
             const unary_expr = try opts.allocator.create(ast.UnaryExpr);
             unary_expr.* = .{
-                .op = self.previous(),
+                .op = self.previous().op().?,
                 .rhs = try self.parseTerm(opts),
             };
             break :blk ast.Expr{ .unary = unary_expr };
@@ -567,7 +540,7 @@ pub const Parser = struct {
             const binary_expr = try opts.allocator.create(ast.BinaryExpr);
             binary_expr.* = .{
                 .lhs = expr,
-                .op = self.previous(),
+                .op = self.previous().op().?,
                 .rhs = try self.parseTerm(opts),
             };
 
@@ -577,3 +550,27 @@ pub const Parser = struct {
         return expr;
     }
 };
+
+pub fn scan(src: []const u8, options: ParseOptions) ![]ast.Token {
+    var tokens: std.ArrayList(ast.Token) = .empty;
+    defer tokens.deinit(options.allocator);
+
+    var scanner: Scanner = .{ .src = src };
+    while (scanner.scanNextToken(null)) |token_or_err| {
+        const token = try token_or_err;
+        try tokens.append(options.allocator, token);
+    }
+    return tokens.toOwnedSlice(options.allocator);
+}
+
+pub fn parse(src: []const ast.Token, options: ParseOptions) ![]ast.Root {
+    var stmt_list: std.ArrayList(ast.Root) = .empty;
+    defer stmt_list.deinit(options.allocator);
+
+    var parser: Parser = .{ .src = src };
+    while (parser.parseNextStmt(options)) |stmt_or_err| {
+        try stmt_list.append(options.allocator, try stmt_or_err);
+    }
+
+    return try stmt_list.toOwnedSlice(options.allocator);
+}

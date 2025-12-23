@@ -1,79 +1,165 @@
 //! src/main.zig
 
+const SubCommands = enum {
+    build,
+    run,
+};
+
+const main_parsers = .{
+    .command = clap.parsers.enumeration(SubCommands),
+};
+
+const main_params = clap.parseParamsComptime(
+    \\-h,--help Display this help and exit
+    \\<command>
+);
+
 pub fn main() !void {
-    var da_impl = std.heap.DebugAllocator(.{}){};
-    defer _ = da_impl.deinit();
-    const gpa = da_impl.allocator();
+    var debug_allocator = std.heap.DebugAllocator(.{}){};
+    defer _ = debug_allocator.deinit();
+    const gpa = debug_allocator.allocator();
 
-    const stdin = std.fs.File.stdin();
-    var buf: [1024]u8 = undefined;
-    var stdin_reader = stdin.reader(&buf);
-    const reader = &stdin_reader.interface;
+    var iter = try std.process.ArgIterator.initWithAllocator(gpa);
+    defer iter.deinit();
 
-    var arena_impl = std.heap.ArenaAllocator.init(gpa);
-    defer arena_impl.deinit();
-    const arena = arena_impl.allocator();
+    _ = iter.next();
 
-    var interpreter: Interpreter = .init(gpa);
-    defer interpreter.deinit();
+    var diag: clap.Diagnostic = .{};
+    var res = clap.parseEx(clap.Help, &main_params, main_parsers, &iter, .{
+        .diagnostic = &diag,
+        .allocator = gpa,
+        .terminating_positional = 0,
+    }) catch |err| {
+        try diag.reportToFile(.stderr(), err);
+        return err;
+    };
+    defer res.deinit();
 
-    while (true) {
-        var line_alloc: std.Io.Writer.Allocating = .init(gpa);
-        defer line_alloc.deinit();
+    if (res.args.help != 0) {
+        try clap.helpToFile(.stdout(), clap.Help, &main_params, .{});
+        return;
+    }
 
-        _ = try reader.streamDelimiterEnding(&line_alloc.writer, '\n');
-        _ = reader.takeByte() catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        try line_alloc.writer.writeAll("\n");
+    const command = res.positionals[0] orelse return error.MissingCommand;
+    try switch (command) {
+        .run => runMain(gpa, &iter),
+        .build => buildMain(gpa, &iter),
+    };
+}
 
-        const line = try arena.dupe(u8, line_alloc.written());
+fn runMain(gpa: Allocator, iter: *std.process.ArgIterator) !void {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help Display this help and quit
+        \\<str>      File to run.
+    );
 
-        var scanner: compiler.Scanner = .{ .src = line };
-        var parse_diag: compiler.Diagnostic = .{};
+    var diag = clap.Diagnostic{};
+    var res = clap.parseEx(clap.Help, &params, clap.parsers.default, iter, .{
+        .diagnostic = &diag,
+        .allocator = gpa,
+    }) catch |err| {
+        try diag.reportToFile(.stderr(), err);
+        return err;
+    };
+    defer res.deinit();
 
-        var tokens: std.ArrayListUnmanaged(ast.Token) = .empty;
-        defer tokens.deinit(gpa);
+    if (res.args.help != 0) {
+        try clap.helpToFile(.stdout(), clap.Help, &params, .{});
+        return;
+    }
 
-        var was_err: bool = false;
+    var arena_allocator: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
 
-        while (scanner.scanNextToken(&parse_diag)) |token_or_err| {
-            const token = token_or_err catch |err| {
-                try parse_diag.reportToFile(.stderr(), err);
-                was_err = true;
-                break;
-            };
+    if (res.positionals[0]) |source_path| {
+        const source_file = try fs.cwd().openFile(source_path, .{});
+        const source = try source_file.readToEndAlloc(gpa, std.math.maxInt(usize));
+        defer gpa.free(source);
 
-            try tokens.append(gpa, token);
-        }
-
-        if (was_err)
-            continue;
-
-        var parser: compiler.Parser = .{ .src = tokens.items };
-        const options: compiler.ParseOptions = .{
-            .allocator = arena_impl.allocator(),
+        var parse_diag: fe.Diagnostic = .{};
+        const options: fe.ParseOptions = .{
+            .allocator = arena,
             .diag = &parse_diag,
         };
+        const tokens = fe.scan(source, options) catch |err| {
+            try parse_diag.reportToFile(.stderr(), err);
+            return err;
+        };
+        const parsed = fe.parse(tokens, options) catch |err| {
+            try parse_diag.reportToFile(.stderr(), err);
+            return err;
+        };
 
-        while (parser.parseNextStmt(options)) |stmt_or_err| {
-            const stmt = stmt_or_err catch |err| {
-                try parse_diag.reportToFile(.stderr(), err);
-                break;
-            };
+        var interp: Interpreter = .init(gpa);
+        defer interp.deinit();
 
-            try interpreter.executeStatement(stmt);
-        }
+        try interp.execSource(parsed);
+    } else {
+        try REPL(gpa);
     }
+}
+
+fn REPL(gpa: Allocator) !void {
+    var arena_allocator: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+
+    var it: Interpreter = .init(gpa);
+    defer it.deinit();
+
+    const f_stdin: fs.File = .stdin();
+    var rbuf: [1024]u8 = undefined;
+    var r_stdin = f_stdin.reader(&rbuf);
+    const stdin = &r_stdin.interface;
+
+    var w_line: Io.Writer.Allocating = .init(gpa);
+    defer w_line.deinit();
+
+    while (true) {
+        _ = try stdin.streamDelimiter(&w_line.writer, '\n');
+        try stdin.streamExact(&w_line.writer, 1);
+
+        const line = try w_line.toOwnedSlice();
+        defer gpa.free(line);
+
+        defer _ = arena_allocator.reset(.retain_capacity);
+        var diag: fe.Diagnostic = .{};
+        const options: fe.ParseOptions = .{
+            .allocator = arena,
+            .diag = &diag,
+        };
+        const tokens = fe.scan(line, options) catch |err| {
+            try diag.reportToFile(.stderr(), err);
+            continue;
+        };
+        const stmts = fe.parse(tokens, options) catch |err| {
+            try diag.reportToFile(.stderr(), err);
+            continue;
+        };
+
+        assert(stmts.len == 1);
+
+        try it.executeStatement(stmts[0]);
+    }
+}
+
+fn buildMain(gpa: Allocator, iter: *std.process.ArgIterator) !void {
+    _ = gpa;
+    _ = iter;
+
+    return error.NotImplemented;
 }
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
+const fs = std.fs;
+const Io = std.Io;
 
-// compiler stuff
-const compiler = @import("compiler.zig");
+const clap = @import("clap");
+
 const ast = @import("ast.zig");
-const fmt = @import("fmt.zig");
+const fe = @import("frontend.zig");
 
 const Interpreter = @import("Interpreter.zig");

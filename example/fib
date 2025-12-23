@@ -10,4 +10,3 @@
 80 LET B = C
 85 LET I = I + 1
 90 GOTO 50 
-RUN
