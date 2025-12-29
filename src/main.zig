@@ -148,6 +148,13 @@ fn REPL(gpa: Allocator) !void {
         var tree: Ast = try .parse(gpa, line, .chunked);
         defer tree.deinit(gpa);
 
+        if (tree.errors.len > 0) {
+            for (tree.errors) |err| {
+                try stderr.print("{any}\n", .{err});
+            }
+            continue;
+        }
+
         var chunk: Chunk = try .generate(gpa, &tree);
         defer chunk.deinit(gpa);
 

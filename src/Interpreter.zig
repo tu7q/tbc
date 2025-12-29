@@ -229,7 +229,12 @@ fn fetchInst(int: *Interpreter) ?Chunk.Inst {
 
 fn exec(int: *Interpreter) Error!void {
     while (true) {
-        const inst = int.fetchInst() orelse return;
+        const maybe_inst =
+            if (int.chunk_i == 0)
+                int.chunkInst()
+            else
+                int.fetchInst();
+        const inst = maybe_inst orelse return;
         // std.debug.print("inst_i: {d}, chunk_i: {d}, inst: {any}\n", .{ int.inst_i - 1, int.chunk_i, inst });
         switch (inst) {
             .cmp_lt,
@@ -359,7 +364,7 @@ fn exec(int: *Interpreter) Error!void {
                 int.w.writeAll("\x1B[2J\x1B[H") catch @panic("TODO");
             },
             .list => @panic("NOT IMPLEMENTED"),
-            .run => int.resetChunkIndices(0),
+            .run => int.resetChunkIndices(1),
             .end => int.resetChunkIndices(std.math.maxInt(usize)),
         }
     }
