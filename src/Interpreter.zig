@@ -1,258 +1,372 @@
 //! src/Interpreter.zig
 
-pub const Interpreter = @This();
-
-/// For convenience
+/// Allocator.
 gpa: Allocator,
 
-/// The index of the current line.
-curr: ?usize = null,
+/// All chunks stored by the interpreter
+/// sorted by line number.
+chunks: std.MultiArrayList(Chunk),
 
-/// All of the instructions
-instructions: std.ArrayList(Instruction) = .empty,
+/// All variables of the interpreter
+variables: [256]isize,
 
-/// Stack lines to goto
-/// Push via gosub
-/// Pop via return
-return_stack: std.ArrayList(usize) = .empty,
+/// The value stack.
+value_stack: std.ArrayListUnmanaged(isize),
 
-// Variables.
-variables: [math.maxInt(u8)]isize,
+/// Return stack.
+return_stack: std.ArrayListUnmanaged(Chunk.LineNumber),
 
-advance_with_step: bool = false,
+/// index of the chunk being executed
+chunk_i: usize,
 
-const Instruction = struct {
-    stmt: ast.Stmt,
-    line: usize,
-};
+/// index of the instruction being executed
+inst_i: usize,
 
-pub fn init(gpa: std.mem.Allocator) Interpreter {
+/// index of the next variable.
+var_i: usize,
+
+/// index of the next number.
+num_i: usize,
+
+str_i: usize,
+
+cmp_flag: bool,
+
+/// Interpreter input
+r: *std.Io.Reader,
+
+/// Interpreter output.
+w: *std.Io.Writer,
+
+buf: []const u8,
+buf_i: usize,
+
+p_delimiter: []const u8 = ", ",
+p_flush: []const u8 = "\n",
+
+pub const Error = error{
+    DivideByZero,
+    InvalidJumpAddress,
+    EmptyValueStack,
+    EmptyReturnStack,
+    LoadOutOfBounds,
+} || Allocator.Error;
+
+pub fn init(gpa: Allocator, r: *std.Io.Reader, w: *std.Io.Writer) Allocator.Error!Interpreter {
+    var chunks: std.MultiArrayList(Chunk) = .empty;
+    errdefer chunks.deinit(gpa);
+    try chunks.append(gpa, .{
+        .line = .immediate,
+        .instructions = &.{},
+        .src = &.{},
+        .variables = &.{},
+        .numbers = &.{},
+        .strings = &.{},
+    });
     return .{
         .gpa = gpa,
-        .variables = [_]isize{0} ** math.maxInt(u8),
+        .chunks = chunks,
+        .variables = [_]isize{0} ** 256,
+        .value_stack = .empty,
+        .return_stack = .empty,
+        .chunk_i = undefined,
+        .inst_i = undefined,
+        .var_i = undefined,
+        .num_i = undefined,
+        .str_i = undefined,
+        .cmp_flag = undefined,
+        .r = r,
+        .w = w,
+        .buf = &.{},
+        .buf_i = 0,
     };
 }
 
-pub fn deinit(self: *Interpreter) void {
-    self.instructions.deinit(self.gpa);
-    self.return_stack.deinit(self.gpa);
-    self.* = undefined;
+pub fn deinit(int: *Interpreter) void {
+    const slice = int.chunks.slice();
+    for (0..slice.len) |i| {
+        var c = slice.get(i);
+        c.deinit(int.gpa);
+    }
+    int.chunks.deinit(int.gpa);
+    int.value_stack.deinit(int.gpa);
+    int.return_stack.deinit(int.gpa);
+    int.* = undefined;
 }
 
-pub fn execSource(self: *Interpreter, src: []const ast.Root) !void {
-    for (src) |stmt| {
-        try self.executeStatement(stmt);
-    }
-    if (self.instructions.items.len > 0) {
-        self.curr = 0;
-        self.run();
+const IndexTag = enum {
+    variable,
+    number,
+    string,
+    inst,
+};
+
+fn resetChunkIndices(int: *Interpreter, chunk: usize) void {
+    int.chunk_i = chunk;
+    int.var_i = 0;
+    int.num_i = 0;
+    int.str_i = 0;
+    int.inst_i = 0;
+    int.buf_i = 0;
+}
+
+fn nextIndex(int: *Interpreter, tag: IndexTag) usize {
+    const index = switch (tag) {
+        .variable => &int.var_i,
+        .number => &int.num_i,
+        .string => &int.str_i,
+        .inst => &int.inst_i,
+    };
+    const result = index.*;
+    index.* += 1;
+    return result;
+}
+
+fn chunkVariable(int: *Interpreter) Error!u8 {
+    assert(int.chunk_i < int.chunks.len);
+    const index = int.nextIndex(.variable);
+    const variables = int.chunks.items(.variables)[int.chunk_i];
+    if (index >= variables.len) return error.LoadOutOfBounds;
+    return variables[index];
+}
+
+fn chunkNumber(int: *Interpreter) Error!usize {
+    assert(int.chunk_i < int.chunks.len);
+    const index = int.nextIndex(.number);
+    const numbers = int.chunks.items(.numbers)[int.chunk_i];
+    if (index >= numbers.len) return error.LoadOutOfBounds;
+    return numbers[index];
+}
+
+fn chunkString(int: *Interpreter) Error![]const u8 {
+    assert(int.chunk_i < int.chunks.len);
+    const index = int.nextIndex(.string);
+    const strings = int.chunks.items(.strings)[int.chunk_i];
+    if (index >= strings.len) return error.LoadOutOfBounds;
+    return strings[index];
+}
+
+fn chunkInst(int: *Interpreter) ?Chunk.Inst {
+    assert(int.chunk_i < int.chunks.len);
+    const index = int.nextIndex(.inst);
+    const instructions = int.chunks.items(.instructions)[int.chunk_i];
+    if (index >= instructions.len) return null;
+    return instructions[index];
+}
+
+fn pop_value(int: *Interpreter) Error!isize {
+    return int.value_stack.pop() orelse return error.EmptyValueStack;
+}
+
+fn push_value(int: *Interpreter, value: isize) Error!void {
+    try int.value_stack.append(int.gpa, value);
+}
+
+fn pop_return(int: *Interpreter) Error!Chunk.LineNumber {
+    return int.return_stack.pop() orelse return error.EmptyReturnStack;
+}
+
+fn push_return(int: *Interpreter, line: Chunk.LineNumber) Error!void {
+    try int.return_stack.append(int.gpa, line);
+}
+
+/// Reset and run until program exits.
+pub fn run(int: *Interpreter) Error!void {
+    if (1 < int.chunks.len) {
+        int.resetChunkIndices(1);
+        try int.exec();
     }
 }
 
-fn indexOfLine(self: Interpreter, line: usize) usize {
-    const upper = std.sort.upperBound(Instruction, self.instructions.items, line, struct {
-        pub fn compareFn(ctx: usize, instruction: Instruction) math.Order {
-            return math.order(ctx, instruction.line);
+pub fn handleChunk(int: *Interpreter, chunk: Chunk) Error!void {
+    try int.chunks.ensureUnusedCapacity(int.gpa, 1);
+    const chunk_clone = try chunk.clone(int.gpa);
+
+    const index = std.sort.equalRange(Chunk.LineNumber, int.chunks.items(.line), chunk.line, struct {
+        pub fn compareFn(ctx: Chunk.LineNumber, elem: Chunk.LineNumber) std.math.Order {
+            return std.math.order(@intFromEnum(ctx), @intFromEnum(elem));
         }
-    }.compareFn);
-    if (upper > 0 and self.instructions.items[upper - 1].line == line) {
-        return upper - 1;
-    }
-    return upper;
-}
+    }.compareFn).@"0";
 
-fn indexOfLineStrict(self: Interpreter, line: usize) ?usize {
-    return std.sort.binarySearch(Instruction, self.instructions.items, line, struct {
-        pub fn compareFn(ctx: usize, instruction: Instruction) math.Order {
-            return math.order(ctx, instruction.line);
-        }
-    }.compareFn);
-}
-
-pub fn executeStatement(self: *Interpreter, root: ast.Root) Allocator.Error!void {
-    if (root.line) |line| {
-        const index = self.indexOfLine(line);
-        if (index < self.instructions.items.len and self.instructions.items[index].line == line) {
-            self.instructions.items[index].stmt = root.stmt;
+    if (index < int.chunks.len) {
+        if (int.chunks.items(.line)[index] == chunk.line) {
+            var c = int.chunks.get(index);
+            c.deinit(int.gpa);
+            int.chunks.set(index, chunk_clone);
         } else {
-            try self.instructions.insert(self.gpa, index, .{
-                .line = line,
-                .stmt = root.stmt,
-            });
+            int.chunks.insertAssumeCapacity(index, chunk_clone);
         }
     } else {
-        assert(self.curr == null);
-        return self.executeImmediately(root.stmt);
+        int.chunks.appendAssumeCapacity(chunk_clone);
+    }
+
+    if (chunk.line == .immediate) {
+        int.resetChunkIndices(0);
+        try int.exec();
     }
 }
 
-fn executeImmediately(self: *Interpreter, stmt: ast.Stmt) void {
-    self.eval(stmt);
-    self.run();
+fn jmpIndex(int: *Interpreter, line: usize) Error!usize {
+    return std.sort.binarySearch(Chunk.LineNumber, int.chunks.items(.line), line, struct {
+        pub fn cmp(ctx: usize, i: Chunk.LineNumber) std.math.Order {
+            return std.math.order(ctx, @intFromEnum(i));
+        }
+    }.cmp) orelse return error.InvalidJumpAddress;
 }
 
-fn run(self: *Interpreter) void {
-    while (self.curr) |curr| {
-        self.advance_with_step = true;
-        self.eval(self.instructions.items[curr].stmt);
-
-        if (self.curr != null) if (self.advance_with_step) {
-            self.curr.? += 1;
-            if (self.curr.? >= self.instructions.items.len) {
-                self.curr = null;
-            }
-        };
-    }
-}
-
-fn eval(self: *Interpreter, stmt: ast.Stmt) void {
-    switch (stmt) {
-        .print => |list| self.evalPrint(list),
-        .@"if" => |if_stmt| self.evalIfStmt(if_stmt.*),
-        .goto => |expr| self.evalGoto(expr),
-        .input => |list| self.evalInput(list),
-        .let => |let_stmt| self.evalLet(let_stmt),
-        .gosub => |expr| self.evalGosub(expr),
-        .@"return" => self.evalReturn(),
-        .clear => self.evalClear(),
-        .list => self.evalList(),
-        .run => self.evalRun(),
-        .end => self.evalEnd(),
-    }
-}
-
-fn evalPrint(self: *Interpreter, list: ast.ExprList) void {
-    switch (list.expr) {
-        .string => |str| std.debug.print("{s}", .{str}),
-        .expr => |expr| std.debug.print("{d}", .{self.computeExpr(expr)}),
-    }
-
-    if (list.next) |next| {
-        std.debug.print(" ", .{});
-        self.evalPrint(next.*);
-    } else std.debug.print("\n", .{});
-}
-
-fn evalIfStmt(self: *Interpreter, if_stmt: ast.IfStmt) void {
-    const lhs = self.computeExpr(if_stmt.lhs_expr);
-    const rhs = self.computeExpr(if_stmt.rhs_expr);
-
-    const then = switch (if_stmt.relop) {
-        .equal => lhs == rhs,
-        .greater => lhs > rhs,
-        .greater_equal => lhs >= rhs,
-        .less => lhs < rhs,
-        .less_equal => lhs <= rhs,
-        .less_greater => lhs != rhs,
-        else => unreachable,
-    };
-
-    if (then)
-        self.eval(if_stmt.stmt);
-}
-
-fn evalGoto(self: *Interpreter, expr: ast.Expr) void {
-    const line = self.computeExpr(expr);
-    const index = self.indexOfLineStrict(@intCast(line)) orelse @panic("TODO");
-    self.curr = index;
-    self.advance_with_step = false;
-}
-
-fn evalInput(self: *Interpreter, list: ast.VarList) void {
-    const stdin = std.fs.File.stdin();
-    var buf: [1024]u8 = undefined;
-    var stdin_reader = stdin.reader(&buf);
-    const reader = &stdin_reader.interface;
-
-    // Hidden allocation yay...
-    var line_alloc: std.Io.Writer.Allocating = .init(self.gpa);
-    defer line_alloc.deinit();
-
-    _ = reader.streamDelimiter(&line_alloc.writer, '\n') catch @panic("");
-    _ = reader.takeByte() catch @panic("");
-
-    var it = std.mem.splitScalar(u8, line_alloc.written(), ' ');
-    var node: ?*const ast.VarList = &list;
-    while (node != null) : (node = node.?.next) {
-        const str = it.next() orelse @panic("Bad input");
-
-        const value: isize = std.fmt.parseInt(isize, str, 10) catch str[0];
-        self.variables[node.?.@"var"] = value;
-    }
-}
-
-fn evalLet(self: *Interpreter, stmt: ast.LetStmt) void {
-    self.variables[stmt.@"var"] = self.computeExpr(stmt.expr);
-}
-
-fn evalGosub(self: *Interpreter, expr: ast.Expr) void {
-    const line = self.computeExpr(expr);
-    const index = self.indexOfLineStrict(@intCast(line)) orelse @panic("TODO");
-    // TODO:
-    // If the very first instruction is an immediately evaluated GOTO
-    // Then the return_stack will be broken.
-    self.return_stack.append(self.gpa, self.instructions.items[self.curr.?].line) catch @panic("TODO");
-    self.curr = index;
-    self.advance_with_step = false;
-}
-
-fn evalReturn(self: *Interpreter) void {
-    const line = self.return_stack.pop() orelse @panic("TODO");
-    const index = self.indexOfLineStrict(line).?;
-    self.curr = index;
-}
-
-fn evalClear(_: *Interpreter) void {
-    std.debug.print("\x1B[2J\x1B[H", .{});
-}
-
-fn evalList(self: *Interpreter) void {
-    const stdout = std.fs.File.stdout();
-    var stdout_writer = stdout.writer(&.{});
-
-    for (self.instructions.items) |instruction| {
-        fmt.prettyPrint(
-            .{ .line = instruction.line, .stmt = instruction.stmt },
-            &stdout_writer.interface,
-        ) catch @panic("");
-    }
-}
-
-fn evalRun(self: *Interpreter) void {
-    self.curr = if (self.instructions.items.len > 0) 0 else null;
-}
-
-fn evalEnd(self: *Interpreter) void {
-    self.curr = null;
-}
-
-fn computeExpr(self: Interpreter, expr: ast.Expr) isize {
-    return switch (expr) {
-        .literal => |token| switch (token) {
-            .number => |n| @intCast(n),
-            .@"var" => |v| self.variables[v],
-            .string => unreachable,
-        },
-        .unary => |unary| switch (unary.op) {
-            .minus => -1 * self.computeExpr(unary.rhs),
-            else => unreachable,
-        },
-        .binary => |binary| switch (binary.op) {
-            .minus => self.computeExpr(binary.lhs) - self.computeExpr(binary.rhs),
-            .plus => self.computeExpr(binary.lhs) + self.computeExpr(binary.rhs),
-            .div => @panic("TODO"),
-            .mul => self.computeExpr(binary.lhs) * self.computeExpr(binary.rhs),
-        },
-        .grouping => |grouping| self.computeExpr(grouping.*),
+fn fetchInst(int: *Interpreter) ?Chunk.Inst {
+    if (int.chunk_i >= int.chunks.len) return null;
+    // if (int.chunk_i == 0 and
+    //     int.chunks.items(.line)[int.chunk_i] == .immediate)
+    // {
+    //     return null;
+    // }
+    return int.chunkInst() orelse {
+        int.resetChunkIndices(int.chunk_i + 1);
+        return int.fetchInst();
     };
 }
 
-const ast = @import("ast.zig");
-const fmt = @import("fmt.zig");
+fn exec(int: *Interpreter) Error!void {
+    while (true) {
+        const inst = int.fetchInst() orelse return;
+        // std.debug.print("inst_i: {d}, chunk_i: {d}, inst: {any}\n", .{ int.inst_i - 1, int.chunk_i, inst });
+        switch (inst) {
+            .cmp_lt,
+            .cmp_lte,
+            .cmp_gt,
+            .cmp_gte,
+            .cmp_eq,
+            .cmp_ne,
+            => {
+                const b = try int.pop_value(); // pop rhs
+                const a = try int.pop_value(); // pop lhs
+                int.cmp_flag = switch (inst) {
+                    .cmp_lt => a < b,
+                    .cmp_lte => a <= b,
+                    .cmp_gt => a > b,
+                    .cmp_gte => a >= b,
+                    .cmp_eq => a == b,
+                    .cmp_ne => a != b,
+                    else => unreachable,
+                };
+            },
+            .load_number => {
+                const number = try int.chunkNumber();
+                try int.push_value(@intCast(number));
+            },
+            .load_variable => {
+                const variable = try int.chunkVariable();
+                try int.push_value(int.variables[variable]);
+            },
+            .add,
+            .sub,
+            .mul,
+            .div,
+            => {
+                const b = try int.pop_value(); // pop rhs
+                const a = try int.pop_value(); // pop lhs
+                try int.push_value(switch (inst) {
+                    .add => a + b,
+                    .sub => a - b,
+                    .mul => a * b,
+                    .div => if (b == 0) return error.DivideByZero else @divTrunc(a, b),
+                    else => unreachable,
+                });
+            },
+            .negate => {
+                try int.push_value(-try int.pop_value());
+            },
+            .print_num => {
+                int.w.print("{d}", .{try int.pop_value()}) catch @panic("TODO");
+            },
+            .print_str => {
+                int.w.print("{s}", .{try int.chunkString()}) catch @panic("TODO");
+            },
+            .print_delimiter => {
+                int.w.writeAll(int.p_delimiter) catch @panic("TODO");
+            },
+            .print_flush => {
+                int.w.writeAll(int.p_flush) catch @panic("TODO");
+            },
+            .break_if_not_cmp => {
+                if (!int.cmp_flag) {
+                    int.resetChunkIndices(int.chunk_i + 1);
+                }
+            },
+            .goto => {
+                const iline = try int.pop_value();
+                if (iline <= 0) return error.InvalidJumpAddress;
+                const index = try int.jmpIndex(@intCast(iline));
+                int.resetChunkIndices(index);
+            },
+            .gosub => {
+                const return_line = int.chunks.items(.line)[int.chunk_i];
+                if (return_line == .immediate) return error.InvalidJumpAddress;
+                const jmp_line = try int.pop_value();
+                if (jmp_line <= 0) return error.InvalidJumpAddress;
+
+                try int.push_return(return_line);
+                errdefer _ = int.pop_return() catch unreachable;
+
+                const index = try int.jmpIndex(@intCast(jmp_line));
+                int.resetChunkIndices(index);
+            },
+            .read_line => {
+                int.gpa.free(int.buf);
+                var allocating: std.Io.Writer.Allocating = .init(int.gpa);
+                defer allocating.deinit();
+
+                _ = int.r.streamDelimiter(&allocating.writer, '\n') catch @panic("TODO");
+                _ = int.r.takeByte() catch @panic("TODO");
+                int.buf = try allocating.toOwnedSlice();
+                int.buf_i = 0;
+            },
+            .push_val => {
+                var it = std.mem.tokenizeAny(u8, int.buf, &std.ascii.whitespace);
+
+                // TODO: Properly store tokenizer state.
+                for (0..int.buf_i) |_| {
+                    _ = it.next();
+                }
+
+                const v = try int.chunkVariable();
+
+                if (it.next()) |s| {
+                    int.variables[v] = std.fmt.parseInt(isize, s, 10) catch |err| switch (err) {
+                        error.InvalidCharacter => s[0],
+                        error.Overflow => @panic("TODO"),
+                    };
+                } else {
+                    int.variables[v] = 0;
+                }
+
+                int.buf_i += 1;
+            },
+            .assign => {
+                const a = try int.pop_value();
+                const v = try int.chunkVariable();
+                int.variables[v] = a;
+            },
+            .@"return" => {
+                const line = try int.pop_return();
+                // We inserted a line at an index. That line should
+                // still exist.
+                const index = int.jmpIndex(@intFromEnum(line)) catch unreachable;
+                int.resetChunkIndices(index + 1);
+            },
+            .clear => {
+                int.w.writeAll("\x1B[2J\x1B[H") catch @panic("TODO");
+            },
+            .list => @panic("NOT IMPLEMENTED"),
+            .run => int.resetChunkIndices(0),
+            .end => int.resetChunkIndices(std.math.maxInt(usize)),
+        }
+    }
+}
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
-
-const math = std.math;
-
 const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const Interpreter = @This();
+const Chunk = @import("Chunk.zig");

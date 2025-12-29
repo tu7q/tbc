@@ -1,0 +1,7 @@
+10 PRINT "enter <d> [+-/*] <d>"
+20 INPUT A, X, B
+30 IF X = 43 THEN PRINT A + B
+40 IF X = 45 THEN PRINT A - B
+50 IF X = 42 THEN PRINT A * B
+60 IF X = 47 THEN PRINT A / B
+70 GOTO 20

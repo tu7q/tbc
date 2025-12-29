@@ -1,198 +1,307 @@
-//! src/ast.zig
+//! src/Ast.zig
+//! an Abstract Syntax Tree (AST) implemented using nodes in a list
+//! The advantage this implementation has over using an arena and
+//! forgetting about it, is that it allows for lists eg in the
+//! case of the print and input statements which are variadic
+//! in their arguments.
 
-pub const TokenKind = enum {
-    left_paren,
-    right_paren,
-    comma,
-    minus,
-    plus,
-    slash,
-    star,
-    equal,
-    greater,
-    greater_equal,
-    greater_less,
-    less,
-    less_equal,
-    less_greater,
-    print,
-    @"if",
-    then,
-    goto,
-    input,
-    let,
-    gosub,
-    @"return",
-    clear,
-    list,
-    run,
-    end,
-    eol,
-    eof,
-    @"var",
-    number,
-    string,
+// So bloody complex..
+
+/// Reference to externally-owned data.
+source: [:0]const u8,
+
+mode: Mode,
+tokens: TokenList.Slice,
+nodes: NodeList.Slice,
+extra_data: []const u32,
+errors: []const Error,
+
+pub const ByteOffset = u32;
+
+pub const TokenList = std.MultiArrayList(struct {
+    tag: Token.Tag,
+    start: ByteOffset,
+});
+
+pub const TokenIndex = u32;
+
+pub const NodeList = std.MultiArrayList(Node);
+
+pub const ExtraIndex = enum(u32) { _ };
+
+pub const Node = struct {
+    tag: Tag,
+    main_token: TokenIndex,
+    data: Data,
+
+    pub const Tag = enum {
+        /// The root node. Must exist at `Node.Index.root`.
+        ///
+        /// The `data` field is a `.extra_range`.
+        /// Where each element in the range is a `Node.Index`.
+        ///
+        /// The `main_token` is the first token in the file.
+        root,
+        /// The `data` field is unused.
+        string_literal,
+        /// The `data` field is unused.
+        number_literal,
+        /// The `data` field is unused.
+        variable,
+        /// `(expr)`.
+        ///
+        /// The `data` field is `node_and_token`.
+        ///  1. a `Node.Index` to the sub-expression.
+        ///  2. a `TokenIndex` to the `)` token.
+        ///
+        /// The `main_token` field is the `(` token.
+        group,
+        /// `lhs + rhs`.
+        ///
+        /// The `main_token` field is the `+` token.
+        add,
+        /// `lhs - rhs`.
+        ///
+        /// The `main_token` field is the `-` token.
+        sub,
+        /// `lhs * rhs`.
+        ///
+        /// The `main_token` field is the `*` token.
+        mul,
+        /// `lhs / rhs`.
+        ///
+        /// The `main_token` field is the `/` token.
+        div,
+        /// `+rhs`.
+        /// The `main_token` field is the `+` token.
+        identity,
+        /// `-rhs`.
+        /// The `main_token` field is the `-` token.
+        negate,
+        /// `lhs < rhs`.
+        ///
+        /// The `main_token` field is the `<` token.
+        less,
+        /// `lhs <= rhs`.
+        ///
+        /// The `main_token` field is the `<=` token.
+        less_equal,
+        /// `lhs > rhs`.
+        ///
+        /// The `main_token` field is the `>` token.
+        greater,
+        /// `lhs >= rhs`.
+        ///
+        /// The `main_token` field is the `>=` token.
+        greater_equal,
+        /// `lhs == rhs`.
+        ///
+        /// The `main_token` field is the `=` token.
+        equal,
+        /// `lhs != rhs`.
+        ///
+        /// The `main_token` field is either the `<>` or `><` tokens.
+        not_equal,
+        /// `line stmt`.
+        ///
+        /// The `data` field is a '.node'.
+        ///   a `Node.Index` to the deffered statement.
+        ///
+        /// The `main_token` field is the number_literal token.
+        defered_statement,
+        /// `PRINT "Hello", X, ...`.
+        ///
+        /// The `data` field is a `.extra_range`.
+        /// Where each element in the range is a `TokenIndex`.
+        ///
+        /// The `main_token` field is the `PRINT` token.
+        print,
+        /// `IF expr relop expr THEN stmt`.
+        ///
+        /// The `data` field is a `node_and_node`:
+        ///   1. a `Node.Index` to the boolean statement.
+        ///   2. a `Node.Index` to the conditional statement.
+        ///
+        /// The `main_token` field is the `IF` token.
+        @"if",
+        /// `GOTO expr`.
+        ///
+        /// The `data` field is a `.node`.
+        ///
+        /// The `main_token` is the `GOTO` token.
+        goto,
+        /// `INPUT X, ...`.
+        ///
+        /// The `data` field is a `.extra_range`.
+        /// Where each element in the range is a `TokenIndex`.
+        ///
+        /// The `main_token` is the `INPUT` token.
+        input,
+        /// `LET var = expr`.
+        ///
+        /// The `data` field is a `.node_and_token`:
+        ///   1. a `Node.Index` to the expression value.
+        ///   2. a `TokenIndex` to the target variable.
+        ///
+        /// The `main_token` is the `LET` token.
+        let,
+        /// `GOSUB expr`.
+        ///
+        /// The `data` field is a `.node`:
+        ///   1. a `Node.Index` to the expression value
+        ///
+        /// The `main_token` is the `GOSUB` token.
+        gosub,
+        /// `RETURN`.
+        /// The `data` field is unused.
+        /// The `main_token` field is the `RETURN` token.
+        @"return",
+        /// `CLEAR`.
+        /// The `data` field is unused.
+        /// The `main_token` field is the `CLEAR` token.
+        clear,
+        /// `LIST`.
+        /// The `data` field is unused.
+        /// The `main_token` field is the `LIST` token.
+        list,
+        /// `RUN`.
+        /// The `data` field is unused.
+        /// The `main_token` field is the `RUN` token.
+        run,
+        /// `END`.
+        /// The `data` field is unused.
+        /// The `main_token` field is the `END` token.
+        end,
+    };
+
+    pub const Data = union(enum) {
+        node: Node.Index,
+        token: TokenIndex,
+        node_and_node: struct { Node.Index, Node.Index },
+        node_and_token: struct { Node.Index, TokenIndex },
+        token_and_token: struct { TokenIndex, TokenIndex },
+        extra_range: SubRange,
+    };
+
+    pub const Index = enum(u32) {
+        root = 0,
+        _,
+    };
+
+    pub const SubRange = struct {
+        /// Index into `extra_data`.
+        start: ExtraIndex,
+        /// Index into `extra_data`.
+        end: ExtraIndex,
+
+        pub fn len(r: SubRange) usize {
+            return @intFromEnum(r.end) - @intFromEnum(r.start);
+        }
+
+        pub fn slice(r: SubRange, extra: []const u32) []const u32 {
+            return extra[@intFromEnum(r.start)..@intFromEnum(r.end)];
+        }
+    };
 };
 
-pub const Token = union(TokenKind) {
-    left_paren,
-    right_paren,
-    comma,
-    minus,
-    plus,
-    slash,
-    star,
-    equal,
-    greater,
-    greater_equal,
-    greater_less,
-    less,
-    less_equal,
-    less_greater,
-    print,
-    @"if",
-    then,
-    goto,
-    input,
-    let,
-    gosub,
-    @"return",
-    clear,
-    list,
-    run,
-    end,
-    eol,
-    eof: void,
-    @"var": u8,
-    number: usize,
-    string: []const u8,
+// TODO: Fix tag + extra.
+//       Use properly in code base.
+//       Make src/Fmt.zig able to print errors.
+pub const Error = struct {
+    tag: Tag,
+    token: TokenIndex,
+    extra: union(enum) {
+        expected_tag: Token.Tag,
+        none: void,
+    },
 
-    pub fn valued_literal(self: Token) ?ValuedLiteral {
-        return switch (self) {
-            .@"var" => |v| .{ .@"var" = v },
-            .number => |v| .{ .number = v },
-            else => null,
-        };
+    pub const Tag = enum {
+        expected_line_number_or_stmt,
+        expected_stmt,
+        expected_expr,
+        expected_relop,
+        expected_var_list,
+        expected_expr_list,
+        expected_grouping,
+        expected_then,
+        expected_variable,
+        expected_equal,
+        expected_eof,
+        overflow,
+        zero_line_number,
+    };
+};
+
+pub fn deinit(tree: *Ast, gpa: Allocator) void {
+    tree.tokens.deinit(gpa);
+    tree.nodes.deinit(gpa);
+    gpa.free(tree.extra_data);
+    gpa.free(tree.errors);
+    tree.* = undefined;
+}
+
+pub const Mode = enum {
+    chunked,
+    all,
+};
+
+pub fn parse(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!Ast {
+    var tokens: TokenList = .empty;
+    defer tokens.deinit(gpa);
+
+    var scanner: Token.Scanner = .{ .src = source };
+    while (true) {
+        const token = scanner.next();
+        try tokens.append(gpa, .{
+            .tag = token.tag,
+            .start = @intCast(token.loc.start),
+        });
+        if (token.tag == .eof) break;
     }
 
-    pub fn relop(self: Token) ?Relop {
-        return switch (self) {
-            .less => .less,
-            .less_equal => .less_equal,
-            .less_greater => .less_greater,
-            .greater => .greater,
-            .greater_equal => .greater_equal,
-            .greater_less => .greater_less,
-            .equal => .equal,
-            else => null,
-        };
+    var nodes: NodeList = .empty;
+    try nodes.ensureTotalCapacity(gpa, 1);
+
+    var parser: Parse = .{
+        .gpa = gpa,
+        .source = source,
+        .tokens = tokens.slice(),
+        .tok_i = 0,
+        .errors = .empty,
+        .nodes = nodes,
+        .extra_data = .empty,
+        .scratch = .empty,
+    };
+    defer parser.errors.deinit(gpa);
+    defer parser.nodes.deinit(gpa);
+    defer parser.extra_data.deinit(gpa);
+    defer parser.scratch.deinit(gpa);
+
+    switch (mode) {
+        .chunked => try parser.parseChunk(),
+        .all => try parser.parseRoot(),
     }
 
-    pub fn op(self: Token) ?Operator {
-        return switch (self) {
-            .plus => .plus,
-            .minus => .minus,
-            .star => .mul,
-            .slash => .div,
-            else => null,
-        };
-    }
-};
+    const extra_data = try parser.extra_data.toOwnedSlice(gpa);
+    errdefer gpa.free(extra_data);
 
-pub const ValuedLiteral = union(enum) {
-    @"var": u8,
-    number: usize,
-    string: []const u8,
-};
+    const errors = try parser.errors.toOwnedSlice(gpa);
+    errdefer gpa.free(errors);
 
-pub const Relop = enum {
-    less,
-    less_equal,
-    less_greater,
-    greater,
-    greater_equal,
-    greater_less,
-    equal,
-};
-
-pub const Operator = enum {
-    plus,
-    minus,
-    div,
-    mul,
-};
-
-/// Root statement of each line.
-pub const Root = struct {
-    line: ?usize,
-    stmt: Stmt,
-};
-
-/// An expression with one argument to the right of the operator.
-pub const UnaryExpr = struct {
-    op: Operator,
-    rhs: Expr,
-};
-
-/// An expression with arguments to the left and right of the operator.
-pub const BinaryExpr = struct {
-    op: Operator,
-    lhs: Expr,
-    rhs: Expr,
-};
-
-/// Any expression
-pub const Expr = union(enum) {
-    unary: *UnaryExpr,
-    binary: *BinaryExpr,
-    literal: ValuedLiteral,
-    grouping: *Expr,
-};
-
-/// A linked list of variables.
-pub const VarList = struct {
-    @"var": u8,
-    next: ?*VarList,
-};
-
-pub const ExprListValue = union(enum) {
-    string: []const u8,
-    expr: Expr,
-};
-
-/// A linked list of expression values.
-pub const ExprList = struct {
-    expr: ExprListValue,
-    next: ?*ExprList,
-};
-
-/// Any statement
-pub const Stmt = union(enum) {
-    print: ExprList,
-    @"if": *IfStmt,
-    input: VarList,
-    let: LetStmt,
-    goto: Expr,
-    gosub: Expr,
-    @"return",
-    clear,
-    list,
-    run,
-    end,
-};
-
-pub const IfStmt = struct {
-    lhs_expr: Expr,
-    relop: Relop,
-    rhs_expr: Expr,
-    stmt: Stmt,
-};
-
-pub const LetStmt = struct {
-    @"var": u8,
-    expr: Expr,
-};
+    return .{
+        .source = source,
+        .tokens = tokens.toOwnedSlice(),
+        .nodes = parser.nodes.toOwnedSlice(),
+        .extra_data = extra_data,
+        .errors = errors,
+        .mode = mode,
+    };
+}
 
 const std = @import("std");
 const assert = std.debug.assert;
-const testing = std.testing;
+const mem = std.mem;
+const Allocator = std.mem.Allocator;
+const Ast = @This();
+const Token = @import("Token.zig");
+const Parse = @import("Parse.zig");

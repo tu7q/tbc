@@ -1,147 +1,171 @@
-//! src/fmt.zig
+//! src/Fmt.zig
+//! TODO: Re-order defered stmts by line.
+//!       (no immediate mode sttms allowed)
 
-///
-pub fn prettyPrint(root: ast.Root, writer: *Io.Writer) !void {
-    if (root.line) |line| {
-        try writer.print("{d} ", .{line});
-    }
+tree: Ast,
+w: *Writer,
 
-    try ppStmt(root.stmt, writer);
-    try writer.writeAll("\n");
-}
+pub fn printTreeToFile(file: std.fs.File, tree: Ast) Writer.Error!void {
+    var buf: [1024]u8 = undefined;
+    var fwriter = file.writer(&buf);
 
-///
-pub fn ppUnaryExpr(unary_expr: *ast.UnaryExpr, writer: *Io.Writer) anyerror!void {
-    const lexeme = switch (unary_expr.op) {
-        .plus => "+",
-        .minus => "-",
-        else => @panic("token was not a unary operator"),
+    const fmt: Fmt = .{
+        .tree = tree,
+        .w = &fwriter.interface,
     };
 
-    try writer.print("{s} ", .{lexeme});
-    try ppExpr(unary_expr.rhs, writer);
+    try fmt.printTree();
+    try (&fwriter.interface).flush();
 }
 
-///
-pub fn ppBinaryExpr(binaray_expr: *ast.BinaryExpr, writer: *Io.Writer) !void {
-    const lexeme = switch (binaray_expr.op) {
-        .div => "/",
-        .mul => "*",
-        .minus => "-",
-        .plus => "+",
+pub fn printTree(fmt: *const Fmt) Writer.Error!void {
+    // Can't format a tree with no errors.
+    assert(fmt.tree.errors.len == 0);
+
+    const root = fmt.tree.nodes.get(@intFromEnum(Ast.Node.Index.root));
+    assert(root.tag == .root);
+
+    const range = root.data.extra_range;
+    for (range.slice(fmt.tree.extra_data)) |i| {
+        try fmt.printTopLevelStmt(@enumFromInt(i));
+    }
+}
+
+pub fn printTopLevelStmt(fmt: *const Fmt, index: NodeIndex) Writer.Error!void {
+    const node = fmt.tree.nodes.get(@intFromEnum(index));
+    switch (node.tag) {
+        .defered_statement => {
+            try fmt.w.print("{s} ", .{fmt.scanToken(node.main_token)});
+            try fmt.printStmt(node.data.node);
+        },
+        else => try fmt.printStmt(index),
+    }
+    try fmt.w.writeAll("\n");
+}
+
+fn printStmt(fmt: *const Fmt, index: NodeIndex) Writer.Error!void {
+    const node = fmt.tree.nodes.get(@intFromEnum(index));
+    switch (node.tag) {
+        .print => {
+            try fmt.w.writeAll("PRINT ");
+            try fmt.printExprList(node.data.extra_range);
+        },
+        .@"if" => {
+            const node_and_node = node.data.node_and_node;
+            try fmt.w.writeAll("IF ");
+            try fmt.printComparison(node_and_node.@"0");
+            try fmt.w.writeAll(" THEN ");
+            try fmt.printStmt(node_and_node.@"1");
+        },
+        .goto => {
+            try fmt.w.writeAll("GOTO ");
+            try fmt.printExpr(node.data.node);
+        },
+        .input => {
+            try fmt.w.writeAll("INPUT ");
+            try fmt.printVarList(node.data.extra_range);
+        },
+        .let => {
+            const node_and_token = node.data.node_and_token;
+            try fmt.w.print("LET {s} = ", .{fmt.scanToken(node_and_token.@"1")});
+            try fmt.printExpr(node_and_token.@"0");
+        },
+        .gosub => {
+            try fmt.w.writeAll("GOTO ");
+            try fmt.printExpr(node.data.node);
+        },
+        .@"return" => try fmt.w.writeAll("RETURN"),
+        .clear => try fmt.w.writeAll("CLEAR"),
+        .list => try fmt.w.writeAll("LIST"),
+        .run => try fmt.w.writeAll("RUN"),
+        .end => try fmt.w.writeAll("END"),
+        else => unreachable,
+    }
+}
+
+fn printExprList(fmt: *const Fmt, range: Ast.Node.SubRange) Writer.Error!void {
+    var pad: []const u8 = "";
+
+    for (range.slice(fmt.tree.extra_data)) |i| {
+        const node = fmt.tree.nodes.get(i);
+
+        try fmt.w.writeAll(pad);
+
+        switch (node.tag) {
+            .string_literal => {
+                try fmt.w.print("{s}", .{fmt.scanToken(node.main_token)});
+            },
+            else => try fmt.printExpr(@enumFromInt(i)),
+        }
+
+        pad = ", ";
+    }
+}
+
+fn printVarList(fmt: *const Fmt, range: Ast.Node.SubRange) Writer.Error!void {
+    var pad: []const u8 = "";
+    for (range.slice(fmt.tree.extra_data)) |i| {
+        try fmt.w.writeAll(pad);
+
+        try fmt.w.print("{s}", .{fmt.scanToken(i)});
+
+        pad = ", ";
+    }
+}
+
+fn printComparison(fmt: *const Fmt, index: NodeIndex) Writer.Error!void {
+    const node = fmt.tree.nodes.get(@intFromEnum(index));
+
+    try fmt.printExpr(node.data.node_and_node.@"0");
+    try fmt.w.print(" {s} ", .{fmt.scanToken(node.main_token)});
+    try fmt.printExpr(node.data.node_and_node.@"1");
+}
+
+fn printExpr(fmt: *const Fmt, index: NodeIndex) Writer.Error!void {
+    const node = fmt.tree.nodes.get(@intFromEnum(index));
+    switch (node.tag) {
+        .number_literal,
+        .variable,
+        => try fmt.w.print("{s}", .{fmt.scanToken(node.main_token)}),
+        .negate, .identity => {
+            try fmt.w.print("{s}", .{fmt.scanToken(node.main_token)});
+            try fmt.printExpr(node.data.node);
+        },
+        .add,
+        .sub,
+        .mul,
+        .div,
+        => {
+            try fmt.printExpr(node.data.node_and_node.@"0");
+            try fmt.w.print(" {s} ", .{fmt.scanToken(node.main_token)});
+            try fmt.printExpr(node.data.node_and_node.@"1");
+        },
+        .group => {
+            try fmt.w.writeAll("(");
+            try fmt.printExpr(node.data.node_and_token.@"0");
+            try fmt.w.writeAll(")");
+        },
+        else => unreachable,
+    }
+}
+
+fn scanToken(fmt: *const Fmt, token_index: Ast.TokenIndex) []const u8 {
+    var scanner: Scanner = .{
+        .src = @ptrCast(fmt.tree.source),
+        .index = fmt.tree.tokens.items(.start)[token_index],
     };
+    const token = scanner.next();
 
-    try ppExpr(binaray_expr.lhs, writer);
-    try writer.print(" {s} ", .{lexeme});
-    try ppExpr(binaray_expr.rhs, writer);
-}
-
-///
-pub fn ppLiteralExpr(literal: ast.ValuedLiteral, writer: *Io.Writer) anyerror!void {
-    switch (literal) {
-        .@"var" => |v| try writer.print("{c}", .{v}),
-        .number => |n| try writer.print("{d}", .{n}),
-        .string => |s| try writer.print("{s}", .{s}),
-    }
-}
-
-///
-pub fn ppGroupingExpr(group: *ast.Expr, writer: *Io.Writer) anyerror!void {
-    try writer.writeAll("(");
-    try ppExpr(group.*, writer);
-    try writer.writeAll("(");
-}
-
-///
-pub fn ppExpr(expr: ast.Expr, writer: *Io.Writer) anyerror!void {
-    switch (expr) {
-        .unary => |unary| try ppUnaryExpr(unary, writer),
-        .binary => |binary| try ppBinaryExpr(binary, writer),
-        .literal => |literal| try ppLiteralExpr(literal, writer),
-        .grouping => |group| try ppGroupingExpr(group, writer),
-    }
-}
-
-///
-pub fn ppExprList(list: ast.ExprList, writer: *Io.Writer) !void {
-    switch (list.expr) {
-        .expr => |expr| try ppExpr(expr, writer),
-        .string => |s| try writer.print("\"{s}\"", .{s}),
-    }
-
-    if (list.next) |next| {
-        try writer.writeAll(", ");
-        try ppExprList(next.*, writer);
-    }
-}
-
-///
-pub fn ppVarList(list: ast.VarList, writer: *Io.Writer) !void {
-    try writer.print("{c}", .{list.@"var"});
-    if (list.next) |next| {
-        try writer.writeAll(", ");
-        try ppVarList(next.*, writer);
-    }
-}
-
-///
-pub fn ppRelop(relop: ast.Relop, writer: *Io.Writer) !void {
-    const lexeme = switch (relop) {
-        .less => "<",
-        .less_equal => "<=",
-        .less_greater => "<>",
-        .greater => ">",
-        .greater_equal => ">=",
-        .greater_less => "><",
-        .equal => "=",
-    };
-
-    try writer.print(" {s} ", .{lexeme});
-}
-
-///
-pub fn ppStmt(stmt: ast.Stmt, writer: *Io.Writer) !void {
-    switch (stmt) {
-        .print => |list| {
-            try writer.writeAll("PRINT ");
-            try ppExprList(list, writer);
-        },
-        .@"if" => |@"if"| {
-            try writer.writeAll("IF ");
-            try ppExpr(@"if".lhs_expr, writer);
-            try ppRelop(@"if".relop, writer);
-            try ppExpr(@"if".rhs_expr, writer);
-            try writer.writeAll(" THEN ");
-            try ppStmt(@"if".stmt, writer);
-        },
-        .goto => |expr| {
-            try writer.writeAll("GOTO ");
-            try ppExpr(expr, writer);
-        },
-        .input => |list| {
-            try writer.writeAll("INPUT ");
-            try ppVarList(list, writer);
-        },
-        .let => |let| {
-            try writer.writeAll("LET ");
-            try writer.print("{c} = ", .{let.@"var"});
-            try ppExpr(let.expr, writer);
-        },
-        .gosub => |expr| {
-            try writer.writeAll("GOSUB ");
-            try ppExpr(expr, writer);
-        },
-        .@"return" => try writer.writeAll("RETURN"),
-        .clear => try writer.writeAll("CLEAR"),
-        .list => try writer.writeAll("LIST"),
-        .run => try writer.writeAll("RUN"),
-        .end => try writer.writeAll("END"),
-    }
+    return fmt.tree.source[token.loc.start..token.loc.end];
 }
 
 const std = @import("std");
 const assert = std.debug.assert;
 
 const Io = std.Io;
+const Writer = Io.Writer;
 
-const ast = @import("ast.zig");
+const Ast = @import("Ast.zig");
+const NodeIndex = Ast.Node.Index;
+const Scanner = @import("Token.zig").Scanner;
+const Fmt = @This();

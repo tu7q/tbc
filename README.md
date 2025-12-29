@@ -20,9 +20,8 @@ PRINT "Hello, World!"
 More examples can be found in the examples directory.
 
 ## TODOS
-1. Better diagnostic support. (especially in REPL)
-2. Proper support for running a file
-3. Add compilation support (long term goal)
+1. Improve error diagnostics
+2. Better memory management of individual chunks in REPL
 
 <!-- LICENSE -->
 ## License
