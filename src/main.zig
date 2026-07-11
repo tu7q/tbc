@@ -14,12 +14,8 @@ const main_params = clap.parseParamsComptime(
     \\<command>
 );
 
-pub fn main() !void {
-    var debug_allocator = std.heap.DebugAllocator(.{}){};
-    defer _ = debug_allocator.deinit();
-    const gpa = debug_allocator.allocator();
-
-    var iter = try std.process.ArgIterator.initWithAllocator(gpa);
+pub fn main(init: std.process.Init) !void {
+    var iter = try init.minimal.args.iterateAllocator(init.gpa);
     defer iter.deinit();
 
     _ = iter.next();
@@ -27,27 +23,27 @@ pub fn main() !void {
     var diag: clap.Diagnostic = .{};
     var res = clap.parseEx(clap.Help, &main_params, main_parsers, &iter, .{
         .diagnostic = &diag,
-        .allocator = gpa,
+        .allocator = init.gpa,
         .terminating_positional = 0,
     }) catch |err| {
-        try diag.reportToFile(.stderr(), err);
+        try diag.reportToFile(init.io, .stderr(), err);
         return err;
     };
     defer res.deinit();
 
     if (res.args.help != 0) {
-        try clap.helpToFile(.stdout(), clap.Help, &main_params, .{});
+        try clap.helpToFile(init.io, .stdout(), clap.Help, &main_params, .{});
         return;
     }
 
     const command = res.positionals[0] orelse return error.MissingCommand;
     try switch (command) {
-        .run => runMain(gpa, &iter),
-        .build => buildMain(gpa, &iter),
+        .run => runMain(init.io, init.gpa, &iter),
+        .build => buildMain(init.io, init.gpa, &iter),
     };
 }
 
-fn runMain(gpa: Allocator, iter: *std.process.ArgIterator) !void {
+fn runMain(io: Io, gpa: Allocator, iter: *std.process.Args.Iterator) !void {
     const params = comptime clap.parseParamsComptime(
         \\-h, --help Display this help and quit
         \\<str>      File to run.
@@ -58,13 +54,13 @@ fn runMain(gpa: Allocator, iter: *std.process.ArgIterator) !void {
         .diagnostic = &diag,
         .allocator = gpa,
     }) catch |err| {
-        try diag.reportToFile(.stderr(), err);
+        try diag.reportToFile(io, .stderr(), err);
         return err;
     };
     defer res.deinit();
 
     if (res.args.help != 0) {
-        try clap.helpToFile(.stdout(), clap.Help, &params, .{});
+        try clap.helpToFile(io, .stdout(), clap.Help, &params, .{});
         return;
     }
 
@@ -73,8 +69,14 @@ fn runMain(gpa: Allocator, iter: *std.process.ArgIterator) !void {
     const arena = arena_allocator.allocator();
 
     if (res.positionals[0]) |source_path| {
-        const source_file = try fs.cwd().openFile(source_path, .{});
-        const source = try source_file.readToEndAlloc(gpa, std.math.maxInt(usize));
+        const source_file = try Io.Dir.cwd().openFile(io, source_path, .{});
+
+        var source_file_reader = source_file.reader(io, &.{});
+        var allocating = Io.Writer.Allocating.init(gpa);
+        _ = try source_file_reader.interface.streamRemaining(&allocating.writer);
+        defer allocating.deinit();
+
+        const source = try allocating.toOwnedSlice();
         defer gpa.free(source);
 
         var parse_diag: fe.Diagnostic = .{};
@@ -82,35 +84,36 @@ fn runMain(gpa: Allocator, iter: *std.process.ArgIterator) !void {
             .allocator = arena,
             .diag = &parse_diag,
         };
+
         const tokens = fe.scan(source, options) catch |err| {
-            try parse_diag.reportToFile(.stderr(), err);
+            try parse_diag.reportToFile(io, .stderr(), err);
             return err;
         };
         const parsed = fe.parse(tokens, options) catch |err| {
-            try parse_diag.reportToFile(.stderr(), err);
+            try parse_diag.reportToFile(io, .stderr(), err);
             return err;
         };
 
-        var interp: Interpreter = .init(gpa);
+        var interp: Interpreter = .init(io, gpa);
         defer interp.deinit();
 
         try interp.execSource(parsed);
     } else {
-        try REPL(gpa);
+        try REPL(io, gpa);
     }
 }
 
-fn REPL(gpa: Allocator) !void {
+fn REPL(io: Io, gpa: Allocator) !void {
     var arena_allocator: std.heap.ArenaAllocator = .init(gpa);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
-    var it: Interpreter = .init(gpa);
+    var it: Interpreter = .init(io, gpa);
     defer it.deinit();
 
-    const f_stdin: fs.File = .stdin();
+    const f_stdin: Io.File = .stdin();
     var rbuf: [1024]u8 = undefined;
-    var r_stdin = f_stdin.reader(&rbuf);
+    var r_stdin = f_stdin.reader(io, &rbuf);
     const stdin = &r_stdin.interface;
 
     var w_line: Io.Writer.Allocating = .init(gpa);
@@ -130,11 +133,11 @@ fn REPL(gpa: Allocator) !void {
             .diag = &diag,
         };
         const tokens = fe.scan(line, options) catch |err| {
-            try diag.reportToFile(.stderr(), err);
+            try diag.reportToFile(io, .stderr(), err);
             continue;
         };
         const stmts = fe.parse(tokens, options) catch |err| {
-            try diag.reportToFile(.stderr(), err);
+            try diag.reportToFile(io, .stderr(), err);
             continue;
         };
 
@@ -144,7 +147,8 @@ fn REPL(gpa: Allocator) !void {
     }
 }
 
-fn buildMain(gpa: Allocator, iter: *std.process.ArgIterator) !void {
+fn buildMain(io: Io, gpa: Allocator, iter: *std.process.Args.Iterator) !void {
+    _ = io;
     _ = gpa;
     _ = iter;
 
@@ -154,7 +158,6 @@ fn buildMain(gpa: Allocator, iter: *std.process.ArgIterator) !void {
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
-const fs = std.fs;
 const Io = std.Io;
 
 const clap = @import("clap");

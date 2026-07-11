@@ -1,6 +1,6 @@
 # A Tiny BASIC Interpreter
 
-This project uses zig 0.15.2
+This project uses zig 0.16.0
 
 <!-- USAGE -->
 ## Usage

@@ -3,6 +3,7 @@
 //! Should call it like parser or something...
 
 const std = @import("std");
+const Io = std.Io;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
@@ -23,9 +24,9 @@ pub const Diagnostic = struct {
     line: ?usize = null,
 
     /// Report an error to a file
-    pub fn reportToFile(diag: Diagnostic, file: std.fs.File, err: anyerror) !void {
+    pub fn reportToFile(diag: Diagnostic, io: Io, file: Io.File, err: anyerror) !void {
         var buf: [1024]u8 = undefined;
-        var writer = file.writer(&buf);
+        var writer = file.writer(io, &buf);
         try diag.report(&writer.interface, err);
         return writer.interface.flush();
     }

@@ -3,6 +3,7 @@
 pub const Interpreter = @This();
 
 /// For convenience
+io: Io,
 gpa: Allocator,
 
 /// The index of the current line.
@@ -26,8 +27,9 @@ const Instruction = struct {
     line: usize,
 };
 
-pub fn init(gpa: std.mem.Allocator) Interpreter {
+pub fn init(io: Io, gpa: std.mem.Allocator) Interpreter {
     return .{
+        .io = io,
         .gpa = gpa,
         .variables = [_]isize{0} ** math.maxInt(u8),
     };
@@ -159,9 +161,9 @@ fn evalGoto(self: *Interpreter, expr: ast.Expr) void {
 }
 
 fn evalInput(self: *Interpreter, list: ast.VarList) void {
-    const stdin = std.fs.File.stdin();
+    const stdin = Io.File.stdin();
     var buf: [1024]u8 = undefined;
-    var stdin_reader = stdin.reader(&buf);
+    var stdin_reader = stdin.reader(self.io, &buf);
     const reader = &stdin_reader.interface;
 
     // Hidden allocation yay...
@@ -207,8 +209,8 @@ fn evalClear(_: *Interpreter) void {
 }
 
 fn evalList(self: *Interpreter) void {
-    const stdout = std.fs.File.stdout();
-    var stdout_writer = stdout.writer(&.{});
+    const stdout = Io.File.stdout();
+    var stdout_writer = stdout.writer(self.io, &.{});
 
     for (self.instructions.items) |instruction| {
         fmt.prettyPrint(
@@ -252,6 +254,7 @@ const fmt = @import("fmt.zig");
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
 const math = std.math;
 
